@@ -5634,6 +5634,171 @@ mod tests {
             assert!(refused_row.details["gate_results"]["failed"].as_u64() >= Some(1));
         }
 
+        // ---- #1: release-immutability backstop on the promotion target -------
+
+        /// Admin, source artifact and a target repo holding a released
+        /// tombstone at the artifact's path with `tombstone_bytes`.
+        struct ReleasedTarget {
+            state: SharedState,
+            src_key: String,
+            tgt_key: String,
+            src: Uuid,
+            tgt: Uuid,
+            user: Uuid,
+            artifact: Uuid,
+            path: String,
+            tombstone_sha256: String,
+            tgt_storage: Arc<dyn crate::storage::StorageBackend>,
+        }
+
+        async fn released_target(
+            pool: &PgPool,
+            tag: &str,
+            tombstone_bytes: &'static [u8],
+        ) -> ReleasedTarget {
+            let sdir = std::env::temp_dir().join(format!("pr1-{tag}-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1-{tag}-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(pool, &format!("{tag}-s"), &sdir).await;
+            let tgt_key = make_repo_key(pool, &format!("{tag}-t"), &tdir).await;
+            let src = repo_id_for_key(pool, &src_key).await;
+            let tgt = repo_id_for_key(pool, &tgt_key).await;
+            let user = make_admin(pool, tag).await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, pool, src).await;
+            let artifact = make_artifact(pool, src, &storage, tag).await;
+            let path = artifact_path(pool, artifact).await;
+            let tgt_storage = storage_for(&state, pool, tgt).await;
+            let tombstone_sha256 =
+                tdh::seed_release_tombstone(pool, tgt, &tgt_storage, &path, tombstone_bytes).await;
+            ReleasedTarget {
+                state,
+                src_key,
+                tgt_key,
+                src,
+                tgt,
+                user,
+                artifact,
+                path,
+                tombstone_sha256,
+                tgt_storage,
+            }
+        }
+
+        fn single_request(rt: &ReleasedTarget) -> Json<PromoteArtifactRequest> {
+            Json(PromoteArtifactRequest {
+                target_repository: Some(rt.tgt_key.clone()),
+                skip_policy_check: false,
+                notes: None,
+            })
+        }
+
+        /// The released tombstone is untouched: same row state and the same
+        /// bytes in target storage (the copy must not run before the refusal).
+        async fn assert_release_intact(pool: &PgPool, rt: &ReleasedTarget) {
+            assert_eq!(
+                tdh::row_state_at(pool, rt.tgt, &rt.path).await,
+                Some((rt.tombstone_sha256.clone(), true)),
+                "the released tombstone must keep its bytes and stay deleted"
+            );
+            let stored = rt.tgt_storage.get(&rt.path).await.expect("tombstone bytes");
+            assert_eq!(&stored[..], b"pr1-released-bytes");
+        }
+
+        /// #1: promoting DIFFERENT bytes onto a released, soft-deleted
+        /// coordinate in the target is refused with 409 and audited, and
+        /// neither the tombstone row nor its stored bytes change.
+        #[tokio::test]
+        async fn test_single_promote_different_bytes_over_release_tombstone_blocked() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let rt = released_target(&pool, "imm1", b"pr1-released-bytes").await;
+
+            let res = promote_artifact(
+                State(rt.state.clone()),
+                Extension(admin_ext(rt.user)),
+                Path((rt.src_key.clone(), rt.artifact)),
+                single_request(&rt),
+            )
+            .await;
+            assert!(
+                matches!(res, Err(AppError::Conflict(_))),
+                "different bytes over a released tombstone must be a 409; got {:?}",
+                res.map(|r| r.0.promoted)
+            );
+            assert_release_intact(&pool, &rt).await;
+            let row = tdh::audit_row_eventually(&pool, rt.artifact, "PROMOTION_REFUSED").await;
+            assert_eq!(row.details["bulk"], false);
+
+            cleanup(&pool, &[rt.src, rt.tgt], rt.user).await;
+        }
+
+        /// #1: the bulk path refuses the same swap per item.
+        #[tokio::test]
+        async fn test_bulk_promote_different_bytes_over_release_tombstone_blocked() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let rt = released_target(&pool, "imm1b", b"pr1-released-bytes").await;
+
+            let res = promote_artifacts_bulk(
+                State(rt.state.clone()),
+                Extension(admin_ext(rt.user)),
+                Path(rt.src_key.clone()),
+                Json(BulkPromoteRequest {
+                    target_repository: Some(rt.tgt_key.clone()),
+                    artifact_ids: vec![rt.artifact],
+                    skip_policy_check: false,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("bulk promote returns a per-item summary");
+            assert_eq!((res.0.promoted, res.0.failed), (0, 1));
+            assert!(
+                res.0.results[0]
+                    .message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("immutable"),
+                "the bulk item must say why; got {:?}",
+                res.0.results[0].message
+            );
+            assert_release_intact(&pool, &rt).await;
+            let row = tdh::audit_row_eventually(&pool, rt.artifact, "PROMOTION_REFUSED").await;
+            assert_eq!(row.details["bulk"], true);
+
+            cleanup(&pool, &[rt.src, rt.tgt], rt.user).await;
+        }
+
+        /// #1: IDENTICAL bytes over a released tombstone is the undelete path
+        /// and still promotes.
+        #[tokio::test]
+        async fn test_single_promote_identical_bytes_over_release_tombstone_allowed() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            // `make_artifact` writes these exact bytes into the source.
+            let rt = released_target(&pool, "imm1s", b"pr1940-artifact-content").await;
+
+            let res = promote_artifact(
+                State(rt.state.clone()),
+                Extension(admin_ext(rt.user)),
+                Path((rt.src_key.clone(), rt.artifact)),
+                single_request(&rt),
+            )
+            .await
+            .expect("identical-bytes promote over a tombstone must succeed");
+            assert!(res.0.promoted);
+            assert_eq!(
+                tdh::row_state_at(&pool, rt.tgt, &rt.path).await,
+                Some((rt.tombstone_sha256.clone(), false)),
+                "the coordinate is live again with the same bytes"
+            );
+
+            cleanup(&pool, &[rt.src, rt.tgt], rt.user).await;
+        }
+
         // ---- max_cve_severity default fix (shared evaluator) -----------------
 
         /// #1940: a rule that does NOT set max_cve_severity (NULL) must NOT

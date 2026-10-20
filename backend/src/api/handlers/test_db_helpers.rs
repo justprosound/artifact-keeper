@@ -1094,6 +1094,51 @@ pub async fn origin_at(pool: &PgPool, repo: Uuid, path: &str) -> serde_json::Val
     origin.expect("every artifact must carry a recorded origin")
 }
 
+/// Seed a *released* tombstone at `(repo, path)`: a versioned row that was
+/// published with `bytes` (stored in `storage` under `path`) and then
+/// soft-deleted. This is the coordinate the release-immutability backstop
+/// protects (#1). Returns the tombstone's sha256.
+pub async fn seed_release_tombstone(
+    pool: &PgPool,
+    repo: Uuid,
+    storage: &Arc<dyn crate::storage::StorageBackend>,
+    path: &str,
+    bytes: &'static [u8],
+) -> String {
+    use sha2::{Digest, Sha256};
+    let checksum = format!("{:x}", Sha256::digest(bytes));
+    storage
+        .put(path, Bytes::from_static(bytes))
+        .await
+        .expect("write tombstone bytes");
+    sqlx::query(
+        "INSERT INTO artifacts (repository_id, name, path, version, size_bytes, \
+         checksum_sha256, content_type, storage_key, is_deleted) \
+         VALUES ($1, $2, $2, '1.0.0', $3, $4, 'application/octet-stream', $2, true)",
+    )
+    .bind(repo)
+    .bind(path)
+    .bind(bytes.len() as i64)
+    .bind(&checksum)
+    .execute(pool)
+    .await
+    .expect("insert release tombstone");
+    checksum
+}
+
+/// `(checksum_sha256, is_deleted)` of the row at `(repo, path)`, live or not.
+pub async fn row_state_at(pool: &PgPool, repo: Uuid, path: &str) -> Option<(String, bool)> {
+    sqlx::query_as(
+        "SELECT checksum_sha256, is_deleted FROM artifacts \
+         WHERE repository_id = $1 AND path = $2",
+    )
+    .bind(repo)
+    .bind(path)
+    .fetch_optional(pool)
+    .await
+    .expect("read row state")
+}
+
 /// Mark a repository public.
 ///
 /// `create_repo` leaves `is_public` at its `false` default, so a repository it
