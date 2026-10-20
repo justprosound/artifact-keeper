@@ -8123,13 +8123,21 @@ pub async fn insert_artifact_row(
 /// Reject if `(repository_id, path)` already exists, otherwise sweep any
 /// soft-deleted row at that path so a subsequent INSERT can proceed.
 ///
+/// The sweep is the checked one (#2): a released tombstone is only purged for
+/// the identical bytes, so delete + re-upload cannot swap a release. Call it
+/// before the storage write; `incoming` is resolved only when such a
+/// tombstone exists.
+///
 /// `conflict_message` is the human-readable message of the
-/// `IMMUTABLE_RELEASE` 409 (e.g. "Module version already exists").
+/// `IMMUTABLE_RELEASE` 409 (e.g. "Module version already exists"), for both
+/// the live row and the released tombstone.
 #[allow(clippy::result_large_err)]
 pub async fn ensure_unique_artifact_path(
     db: &PgPool,
+    format: &RepositoryFormat,
     repo_id: Uuid,
     artifact_path: &str,
+    incoming: super::IncomingDigest<'_>,
     conflict_message: &str,
 ) -> Result<(), Response> {
     let existing: Option<Uuid> = sqlx::query_scalar(
@@ -8145,8 +8153,14 @@ pub async fn ensure_unique_artifact_path(
         return Err(AppError::Immutable(conflict_message.to_string()).into_response());
     }
 
-    super::cleanup_soft_deleted_artifact(db, repo_id, artifact_path).await;
-    Ok(())
+    super::purge_tombstone_checked(db, format, repo_id, artifact_path, incoming)
+        .await
+        .map_err(|e| match e {
+            AppError::Immutable(_) => {
+                AppError::Immutable(conflict_message.to_string()).into_response()
+            }
+            other => other.into_response(),
+        })
 }
 
 /// Upsert format-specific metadata for a freshly-uploaded artifact and bump
@@ -16120,8 +16134,10 @@ mod tests {
 
         let result = ensure_unique_artifact_path(
             &pool,
+            &crate::models::repository::RepositoryFormat::Puppet,
             repo_id,
             "module/1.0.0/module-1.0.0.tar.gz",
+            crate::api::handlers::IncomingDigest::Known("x"),
             "Module version already exists",
         )
         .await;
@@ -16157,8 +16173,10 @@ mod tests {
 
         let err = ensure_unique_artifact_path(
             &pool,
+            &crate::models::repository::RepositoryFormat::Ansible,
             repo_id,
             "coll/1.0.0/coll.tar.gz",
+            crate::api::handlers::IncomingDigest::Known("x"),
             "Collection version already exists",
         )
         .await

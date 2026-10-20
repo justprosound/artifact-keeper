@@ -575,6 +575,17 @@ async fn upload_object(
     )
     .await?;
 
+    // Before the put: the storage key is path-derived (#2).
+    super::purge_tombstone_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Gitlfs,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Known(&oid),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+
     // Store the object, streaming it from the scratch file.
     let storage_key = format!("gitlfs/{}/{}", &oid[..2], oid);
     let storage = state
@@ -591,8 +602,6 @@ async fn upload_object(
             )
         })?;
     drop(staged);
-
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
     // Insert artifact record
     let mut tx = super::publish_quota::begin_admitted_publish(

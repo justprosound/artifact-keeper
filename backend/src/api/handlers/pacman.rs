@@ -751,8 +751,10 @@ async fn store_package(
     let artifact_path = package_artifact_path(&info.arch, filename);
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
+        &crate::models::repository::RepositoryFormat::Pacman,
         repo.id,
         &artifact_path,
+        super::IncomingDigest::Bytes(&body),
         "Package already exists",
     )
     .await?;

@@ -109,6 +109,69 @@ pub async fn cleanup_soft_deleted_artifact_checked(
     path: &str,
     new_checksum_sha256: &str,
 ) -> crate::error::Result<()> {
+    purge_tombstone_checked(
+        db,
+        format,
+        repository_id,
+        path,
+        IncomingDigest::Known(new_checksum_sha256),
+    )
+    .await
+}
+
+/// The SHA-256 of the bytes a publish is about to store, in whatever form the
+/// handler holds it when the release check must run (#2).
+///
+/// The check has to run BEFORE the storage write, because format storage keys
+/// are path-derived: writing first would overwrite the released object before
+/// the refusal. Several handlers only learn the digest during that write
+/// (`put_artifact_stream`), so they hand over the staged file instead and the
+/// digest is computed here — and only when a released tombstone actually
+/// exists at the path, so the common no-tombstone publish pays nothing.
+pub enum IncomingDigest<'a> {
+    /// Lowercase-hex SHA-256 the handler already computed.
+    Known(&'a str),
+    /// A body spooled to scratch; hashed by streaming the file.
+    Staged(&'a proxy_helpers::StagedUpload),
+    /// A body held in memory.
+    Bytes(&'a [u8]),
+}
+
+impl IncomingDigest<'_> {
+    async fn resolve(&self) -> crate::error::Result<String> {
+        use futures::StreamExt;
+        use sha2::{Digest, Sha256};
+        match self {
+            Self::Known(sha256) => Ok((*sha256).to_string()),
+            Self::Bytes(bytes) => Ok(format!("{:x}", Sha256::digest(bytes))),
+            Self::Staged(staged) => {
+                let mut stream = proxy_helpers::open_staged_upload_stream(staged)
+                    .await
+                    .map_err(|_| {
+                        crate::error::AppError::Internal(
+                            "Failed to reopen the staged upload".to_string(),
+                        )
+                    })?;
+                let mut hasher = Sha256::new();
+                while let Some(chunk) = stream.next().await {
+                    hasher.update(&chunk?);
+                }
+                Ok(format!("{:x}", hasher.finalize()))
+            }
+        }
+    }
+}
+
+/// [`cleanup_soft_deleted_artifact_checked`] for a handler that holds the
+/// incoming body as an [`IncomingDigest`] rather than a computed checksum. The
+/// digest is resolved only when a released tombstone sits at `path`.
+pub async fn purge_tombstone_checked(
+    db: &sqlx::PgPool,
+    format: &crate::models::repository::RepositoryFormat,
+    repository_id: uuid::Uuid,
+    path: &str,
+    incoming: IncomingDigest<'_>,
+) -> crate::error::Result<()> {
     use crate::error::AppError;
     use crate::services::cache_classifier;
 
@@ -133,7 +196,7 @@ pub async fn cleanup_soft_deleted_artifact_checked(
             if is_released
                 && !prior
                     .checksum_sha256
-                    .eq_ignore_ascii_case(new_checksum_sha256)
+                    .eq_ignore_ascii_case(&incoming.resolve().await?)
             {
                 return Err(AppError::Immutable(
                     "Artifact version already exists and is immutable".to_string(),
@@ -1289,6 +1352,196 @@ mod tests {
 
         cleanup_repo(&pool, repo).await;
     }
+
+    /// SHA-256 of `b"abc"`.
+    const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    async fn tombstones(pool: &sqlx::PgPool, repo: uuid::Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+            .bind(repo)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Spool `body` through the real staging primitive (#2).
+    async fn stage(
+        pool: &sqlx::PgPool,
+        body: &'static [u8],
+    ) -> (
+        tempfile::TempDir,
+        crate::api::handlers::proxy_helpers::StagedUpload,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::api::handlers::test_db_helpers::build_state(
+            pool.clone(),
+            dir.path().to_str().unwrap(),
+        );
+        let chunks = futures::stream::iter(vec![Ok::<_, std::io::Error>(
+            bytes::Bytes::from_static(body),
+        )]);
+        let (staged, _) =
+            crate::api::handlers::proxy_helpers::stage_stream_content_addressed(&state, chunks)
+                .await
+                .unwrap_or_else(|_| panic!("stage upload"));
+        (dir, staged)
+    }
+
+    /// #2: an in-memory body is hashed and compared against the tombstone.
+    #[tokio::test]
+    async fn purge_checked_hashes_in_memory_bytes_2() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "generic").await;
+        let path = "pkg/1.0.0/pkg.bin"; // versioned -> released
+        insert_tombstone(&pool, repo, path, ABC_SHA256).await;
+
+        let swapped = purge_tombstone_checked(
+            &pool,
+            &RepositoryFormat::Generic,
+            repo,
+            path,
+            IncomingDigest::Bytes(b"abd"),
+        )
+        .await;
+        assert!(matches!(swapped, Err(crate::error::AppError::Immutable(_))));
+        assert_eq!(tombstones(&pool, repo).await, 1, "refused tombstone stays");
+
+        let same = purge_tombstone_checked(
+            &pool,
+            &RepositoryFormat::Generic,
+            repo,
+            path,
+            IncomingDigest::Bytes(b"abc"),
+        )
+        .await;
+        assert!(same.is_ok(), "identical bytes purge the tombstone");
+        assert_eq!(tombstones(&pool, repo).await, 0);
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// #2: a staged body is hashed by streaming the scratch file.
+    #[tokio::test]
+    async fn purge_checked_hashes_a_staged_upload_2() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "generic").await;
+        let path = "pkg/1.0.0/pkg.bin";
+        insert_tombstone(&pool, repo, path, ABC_SHA256).await;
+
+        let (_dir, other) = stage(&pool, b"abd").await;
+        let swapped = purge_tombstone_checked(
+            &pool,
+            &RepositoryFormat::Generic,
+            repo,
+            path,
+            IncomingDigest::Staged(&other),
+        )
+        .await;
+        assert!(matches!(swapped, Err(crate::error::AppError::Immutable(_))));
+
+        let (_dir2, same) = stage(&pool, b"abc").await;
+        let res = purge_tombstone_checked(
+            &pool,
+            &RepositoryFormat::Generic,
+            repo,
+            path,
+            IncomingDigest::Staged(&same),
+        )
+        .await;
+        assert!(res.is_ok(), "identical staged bytes purge the tombstone");
+        assert_eq!(tombstones(&pool, repo).await, 0);
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// #2: the staged file is read ONLY when a released tombstone exists. With
+    /// the scratch file gone, a path with no tombstone still proceeds, and a
+    /// released one surfaces the read failure instead of purging.
+    #[tokio::test]
+    async fn purge_checked_resolves_the_digest_lazily_2() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "generic").await;
+        let (_dir, staged) = stage(&pool, b"abc").await;
+        std::fs::remove_file(staged.path()).unwrap();
+
+        let fresh = purge_tombstone_checked(
+            &pool,
+            &RepositoryFormat::Generic,
+            repo,
+            "pkg/2.0.0/pkg.bin",
+            IncomingDigest::Staged(&staged),
+        )
+        .await;
+        assert!(fresh.is_ok(), "no tombstone: the digest is never needed");
+
+        let path = "pkg/1.0.0/pkg.bin";
+        insert_tombstone(&pool, repo, path, ABC_SHA256).await;
+        let released = purge_tombstone_checked(
+            &pool,
+            &RepositoryFormat::Generic,
+            repo,
+            path,
+            IncomingDigest::Staged(&staged),
+        )
+        .await;
+        assert!(
+            matches!(released, Err(crate::error::AppError::Internal(_))),
+            "a released tombstone needs the digest: {released:?}"
+        );
+        assert_eq!(tombstones(&pool, repo).await, 1);
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// #2: `ensure_unique_artifact_path` refuses a released tombstone with the
+    /// caller's conflict message in the `IMMUTABLE_RELEASE` body.
+    #[tokio::test]
+    async fn ensure_unique_refuses_a_released_tombstone_2() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "helm").await;
+        let path = "demo/1.0.0/demo-1.0.0.tgz";
+        insert_tombstone(&pool, repo, path, ABC_SHA256).await;
+
+        let err = crate::api::handlers::proxy_helpers::ensure_unique_artifact_path(
+            &pool,
+            &RepositoryFormat::Helm,
+            repo,
+            path,
+            IncomingDigest::Bytes(b"abd"),
+            "Chart demo version 1.0.0 already exists",
+        )
+        .await
+        .expect_err("released tombstone must refuse different bytes");
+        assert_eq!(err.status(), axum::http::StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(err.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE);
+        assert_eq!(json["message"], "Chart demo version 1.0.0 already exists");
+
+        crate::api::handlers::proxy_helpers::ensure_unique_artifact_path(
+            &pool,
+            &RepositoryFormat::Helm,
+            repo,
+            path,
+            IncomingDigest::Bytes(b"abc"),
+            "Chart demo version 1.0.0 already exists",
+        )
+        .await
+        .unwrap_or_else(|_| panic!("identical bytes must pass"));
+        assert_eq!(tombstones(&pool, repo).await, 0);
+
+        cleanup_repo(&pool, repo).await;
+    }
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -1299,6 +1552,25 @@ mod immutable_release_envelope_tests {
     use crate::error::IMMUTABLE_RELEASE_CODE;
     use axum::http::StatusCode;
     use axum::response::Response;
+
+    /// #2: a purge failure that is not a refusal keeps its own status in every
+    /// format envelope, and Connect reports a refusal as `already_exists`.
+    #[test]
+    fn purge_failures_that_are_not_refusals_keep_their_status_2() {
+        use crate::error::AppError;
+        let internal = || AppError::Internal("boom".to_string());
+        for response in [
+            super::pub_registry::pub_purge_refusal(internal()),
+            super::swift::swift_purge_refusal(internal()),
+            super::protobuf::connect_purge_error(internal()),
+        ] {
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        let refused = super::protobuf::connect_purge_error(AppError::Immutable(
+            "Artifact version already exists and is immutable".to_string(),
+        ));
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+    }
 
     /// #5: every format's release-immutability refusal is a 409 that carries
     /// the stable code, inside the envelope that format's clients parse,
@@ -1330,6 +1602,22 @@ mod immutable_release_envelope_tests {
                 super::swift::swift_immutable_response(
                     "A release with this version already exists",
                 ),
+                "/code",
+                "/detail",
+            ),
+            (
+                "pub `error`, checked tombstone purge (#2)",
+                super::pub_registry::pub_purge_refusal(crate::error::AppError::Immutable(
+                    "Artifact version already exists and is immutable".to_string(),
+                )),
+                "/error/code",
+                "/error/message",
+            ),
+            (
+                "swift problem+json, checked tombstone purge (#2)",
+                super::swift::swift_purge_refusal(crate::error::AppError::Immutable(
+                    "Artifact version already exists and is immutable".to_string(),
+                )),
                 "/code",
                 "/detail",
             ),
@@ -2969,5 +3257,159 @@ mod raw_error_body_class_tests {
              wording:\n{}",
             unmatched.join("\n")
         );
+    }
+}
+
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod unchecked_purge_guard_tests {
+    // ---------------------------------------------------------------------------
+    // #2: no handler may purge a tombstone without the release check.
+    //
+    // `cleanup_soft_deleted_artifact` deletes a soft-deleted row unconditionally.
+    // Called ahead of an INSERT, it lets delete + re-upload swap the bytes behind
+    // a released coordinate, which is how ~15 formats lost release immutability.
+    // Every publish path now goes through `purge_tombstone_checked` (directly,
+    // via `cleanup_soft_deleted_artifact_checked`, or via
+    // `proxy_helpers::ensure_unique_artifact_path`); this gate keeps a new
+    // handler from reaching for the unchecked purge again.
+    // ---------------------------------------------------------------------------
+
+    use super::like_pattern_escape_class_tests::{rust_sources, test_module_line_ranges};
+
+    const NAME: &str = "cleanup_soft_deleted_artifact";
+
+    /// Files that still call the unchecked purge, each with its reason. The
+    /// stale-entry test fails once a file stops needing its entry.
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "promotion.rs",
+            "checked before the copy by fork #1, which must land before or with this",
+        ),
+        (
+            "approval.rs",
+            "checked before the copy by fork #1, which must land before or with this",
+        ),
+    ];
+
+    /// The definition and the checked wrapper's own purge, in `mod.rs`.
+    const DEFINITION_LINES: &[&str] = &[
+        "pub async fn cleanup_soft_deleted_artifact(",
+        "cleanup_soft_deleted_artifact(db, repository_id, path).await;",
+    ];
+
+    /// Whether `line` names the unchecked purge as a whole identifier: a call
+    /// through any path (`super::`, `crate::api::handlers::`, bare) or an
+    /// import that would let a bare call bypass the prefixes. The `_checked`
+    /// wrapper does not match.
+    fn names_the_unchecked_purge(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            return false;
+        }
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        line.match_indices(NAME).any(|(at, _)| {
+            let before = line[..at].chars().next_back();
+            let after = line[at + NAME.len()..].chars().next();
+            !before.is_some_and(ident) && !after.is_some_and(ident)
+        })
+    }
+
+    /// Non-test sites in one source file, as 1-based line numbers.
+    fn sites(name: &str, src: &str) -> Vec<usize> {
+        let tests = test_module_line_ranges(src);
+        src.lines()
+            .enumerate()
+            .filter(|(index, line)| {
+                let number = index + 1;
+                names_the_unchecked_purge(line)
+                    && !tests.iter().any(|(s, e)| number >= *s && number <= *e)
+                    && !(name == "mod.rs" && DEFINITION_LINES.contains(&line.trim()))
+            })
+            .map(|(index, _)| index + 1)
+            .collect()
+    }
+
+    /// Every `(file, line)` site under `api/handlers`.
+    fn handler_sites() -> Vec<(String, usize, String)> {
+        let mut out = Vec::new();
+        for (path, src) in rust_sources() {
+            if !path.to_string_lossy().contains("api/handlers") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let lines: Vec<&str> = src.lines().collect();
+            for number in sites(&name, &src) {
+                out.push((name.clone(), number, lines[number - 1].trim().to_string()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn no_handler_purges_a_tombstone_unchecked_2() {
+        let offenders: Vec<String> = handler_sites()
+            .into_iter()
+            .filter(|(file, _, _)| !ALLOWED.iter().any(|(f, _)| f == file))
+            .map(|(file, number, line)| format!("{file}:{number}: {line}"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "#2: a handler purges a soft-deleted row without the release check, so \
+             delete + re-upload can swap a released coordinate's bytes. Use \
+             `super::purge_tombstone_checked` (before the storage write) or \
+             `proxy_helpers::ensure_unique_artifact_path` instead:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn every_allowlisted_file_still_calls_the_unchecked_purge_2() {
+        let sites = handler_sites();
+        let stale: Vec<&str> = ALLOWED
+            .iter()
+            .map(|(file, _)| *file)
+            .filter(|file| !sites.iter().any(|(f, _, _)| f == file))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "#2: these files no longer call the unchecked purge; drop their \
+             allowlist entries: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn the_scanner_recognises_the_shapes_it_claims_to_2() {
+        for hit in [
+            "    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &path).await;",
+            "    crate::api::handlers::cleanup_soft_deleted_artifact(db, id, &p).await;",
+            "    cleanup_soft_deleted_artifact(db, id, &p).await;",
+            "use super::cleanup_soft_deleted_artifact;",
+            "use super::{cleanup_soft_deleted_artifact, db_err};",
+        ] {
+            assert!(names_the_unchecked_purge(hit), "must flag: {hit}");
+        }
+        for miss in [
+            "    super::cleanup_soft_deleted_artifact_checked(&state.db, &f, id, &p, &s)",
+            "    // super::cleanup_soft_deleted_artifact(&state.db, repo.id, &path)",
+            "    /// [`cleanup_soft_deleted_artifact`] deletes unconditionally.",
+            "    my_cleanup_soft_deleted_artifact(db, id, &p).await;",
+        ] {
+            assert!(!names_the_unchecked_purge(miss), "must not flag: {miss}");
+        }
+
+        // A `#[cfg(test)] mod` region is exempt; production code is not, and
+        // the definition is exempt only in `mod.rs`.
+        let src = "fn live() {\n    super::cleanup_soft_deleted_artifact(db, id, p).await;\n}\n\
+                   #[cfg(test)]\nmod tests {\n    \
+                   super::cleanup_soft_deleted_artifact(db, id, p).await;\n}\n";
+        assert_eq!(sites("x.rs", src), vec![2]);
+        let def = "pub async fn cleanup_soft_deleted_artifact(\n";
+        assert!(sites("mod.rs", def).is_empty());
+        assert_eq!(sites("x.rs", def), vec![1]);
     }
 }

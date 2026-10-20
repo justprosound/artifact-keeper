@@ -1777,8 +1777,10 @@ async fn upload_collection(
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
+        &crate::models::repository::RepositoryFormat::Ansible,
         repo.id,
         &artifact_path,
+        super::IncomingDigest::Staged(&staged),
         "Collection version already exists",
     )
     .await?;

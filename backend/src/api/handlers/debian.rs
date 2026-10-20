@@ -3923,7 +3923,15 @@ async fn persist_debian_upload(
         return Err(super::immutable_release("Package already exists"));
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &upload.artifact_path).await;
+    super::purge_tombstone_checked(
+        &state.db,
+        &RepositoryFormat::Debian,
+        repo.id,
+        &upload.artifact_path,
+        super::IncomingDigest::Bytes(&body),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     let storage = state
         .storage_for_repo(&repo.storage_location())

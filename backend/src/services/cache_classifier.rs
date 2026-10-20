@@ -374,6 +374,11 @@ pub fn is_explicitly_mutable_index(format: &RepositoryFormat, path: &str) -> boo
         // is a no-op for conan (matching the conan upload handlers' intent).
         RepositoryFormat::Conan => true,
 
+        // The Buf registry's per-module label map (`modules/<m>/_labels`) is a
+        // registry-generated pointer rewritten on every label move; its
+        // commits are content-addressed coordinates (#2).
+        RepositoryFormat::Protobuf => leaf(&lower) == "_labels",
+
         // Default-format families (Generic, Nuget, Composer, Go,
         // Helm, ...) have no in-place index files at artifact coordinates:
         // every stored path is a release coordinate. The GitHub mirror
@@ -931,6 +936,15 @@ mod tests {
                 "{f:?} coordinates must be treated as release coordinates"
             );
         }
+        // #2: protobuf's label map is the one pointer; a commit is a release.
+        assert!(is_explicitly_mutable_index(
+            &Protobuf,
+            "modules/acme/_labels"
+        ));
+        assert!(!is_explicitly_mutable_index(
+            &Protobuf,
+            "modules/acme/commits/0123abcd"
+        ));
     }
 
     // ----- classify(): per-format immutable-vs-mutable table (#1611 §2.1) ---

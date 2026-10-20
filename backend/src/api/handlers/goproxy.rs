@@ -1591,7 +1591,15 @@ async fn upload_zip(
         )));
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::purge_tombstone_checked(
+        &state.db,
+        &RepositoryFormat::Go,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Bytes(&body),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     // Compute SHA256
     let mut hasher = Sha256::new();
@@ -1759,7 +1767,15 @@ async fn upload_mod(
         )));
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::purge_tombstone_checked(
+        &state.db,
+        &RepositoryFormat::Go,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Bytes(&body),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     // Compute SHA256
     let mut hasher = Sha256::new();

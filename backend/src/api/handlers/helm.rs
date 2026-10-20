@@ -1037,18 +1037,27 @@ async fn upload_chart(
         "Chart {} version {} already exists",
         chart_name, chart_version
     );
-    proxy_helpers::ensure_unique_artifact_path(&state.db, repo.id, &artifact_path, &conflict_msg)
-        .await?;
+    proxy_helpers::ensure_unique_artifact_path(
+        &state.db,
+        &RepositoryFormat::Helm,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Staged(&staged),
+        &conflict_msg,
+    )
+    .await?;
 
     // The prov is stored under the chart's filename + `.prov` -- the exact path
     // helm derives from the index URL (#2635).
     let prov_filename = prov_filename(&filename);
     let prov_artifact_path = format!("{}/{}/{}", chart_name, chart_version, prov_filename);
-    if staged_prov.is_some() {
+    if let Some(prov) = staged_prov.as_ref() {
         proxy_helpers::ensure_unique_artifact_path(
             &state.db,
+            &RepositoryFormat::Helm,
             repo.id,
             &prov_artifact_path,
+            super::IncomingDigest::Staged(prov),
             &conflict_msg,
         )
         .await?;

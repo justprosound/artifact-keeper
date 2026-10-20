@@ -348,8 +348,10 @@ async fn push_gem(
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
+        &RepositoryFormat::Rubygems,
         repo.id,
         &artifact_path,
+        super::IncomingDigest::Known(&computed_sha256),
         "Gem version already exists",
     )
     .await?;

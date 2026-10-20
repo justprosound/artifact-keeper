@@ -4396,7 +4396,15 @@ async fn publish_extension(
     )
     .await?;
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::purge_tombstone_checked(
+        &state.db,
+        &RepositoryFormat::Vscode,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Known(&computed_sha256),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     // Store the file
     let storage_key = build_vscode_storage_key(&publisher, &ext_name, &ext_version);

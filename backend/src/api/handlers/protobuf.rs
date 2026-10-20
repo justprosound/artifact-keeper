@@ -398,6 +398,23 @@ fn connect_error(status: StatusCode, code: &str, message: &str) -> Response {
     )
 }
 
+/// Connect envelope for a checked tombstone-purge failure (#2).
+pub(super) fn connect_purge_error(e: crate::error::AppError) -> Response {
+    match e {
+        crate::error::AppError::Immutable(message) => {
+            connect_error(StatusCode::CONFLICT, "already_exists", &message)
+        }
+        other => {
+            tracing::error!("protobuf tombstone purge failed: {other}");
+            connect_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "Internal server error",
+            )
+        }
+    }
+}
+
 /// A database failure as the Connect `internal` error.
 fn connect_db_error(e: sqlx::Error) -> Response {
     connect_error(
@@ -749,7 +766,17 @@ async fn save_label_index(
     let artifact_id = match existing_id {
         Some(id) => id,
         None => {
-            crate::api::handlers::cleanup_soft_deleted_artifact(db, repo_id, &label_path).await;
+            // `_labels` is a mutable index (`is_explicitly_mutable_index`), so the
+            // check passes it through to the purge.
+            crate::api::handlers::purge_tombstone_checked(
+                db,
+                &crate::models::repository::RepositoryFormat::Protobuf,
+                repo_id,
+                &label_path,
+                crate::api::handlers::IncomingDigest::Known("none"),
+            )
+            .await
+            .map_err(connect_purge_error)?;
             // Create label index artifact
             // NO-SCAN-ON-UPLOAD: the `_labels` index is a registry-generated
             // JSON document, not uploaded content; the module upload itself
@@ -1198,6 +1225,18 @@ async fn upload(
             .await,
         )?;
 
+        // Before the put: the storage key is path-derived (#2). The commit
+        // digest is the row's recorded checksum.
+        super::purge_tombstone_checked(
+            &state.db,
+            &crate::models::repository::RepositoryFormat::Protobuf,
+            repo.id,
+            &artifact_path,
+            super::IncomingDigest::Known(&commit_digest),
+        )
+        .await
+        .map_err(connect_purge_error)?;
+
         // Store via StorageBackend
         let storage_key = build_module_storage_key(&module_name, &commit_digest);
         proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
@@ -1212,8 +1251,6 @@ async fn upload(
                 crate::api::handlers::storage_err_message(&e),
             )
         })?;
-
-        super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
 
         // Insert artifact record, admitted against the storage quotas in the
         // same transaction (#4422).

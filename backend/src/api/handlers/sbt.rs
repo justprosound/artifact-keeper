@@ -545,7 +545,15 @@ async fn upload_artifact(
         ));
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::purge_tombstone_checked(
+        &state.db,
+        &RepositoryFormat::Sbt,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Known(&computed_sha256),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     // Determine content type
     let content_type = if path_info.is_ivy_descriptor {

@@ -205,6 +205,17 @@ fn swift_error_response(status: StatusCode, detail: &str) -> Response {
 /// The release-immutability 409 (#5): the registry's problem+json body with
 /// the stable `code` as an RFC 7807 extension member, so SwiftPM still reads
 /// `detail` and other clients can match on the code.
+/// Render a checked tombstone-purge failure (#2): a released-coordinate
+/// refusal as problem+json, anything else as its own response.
+pub(super) fn swift_purge_refusal(e: crate::error::AppError) -> Response {
+    match e {
+        crate::error::AppError::Immutable(_) => {
+            swift_immutable_response("A release with this version already exists")
+        }
+        other => other.into_response(),
+    }
+}
+
 pub(super) fn swift_immutable_response(detail: &str) -> Response {
     swift_problem_response(
         StatusCode::CONFLICT,
@@ -1090,7 +1101,15 @@ async fn publish_release(
         ));
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::purge_tombstone_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Swift,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Staged(&parts.staged),
+    )
+    .await
+    .map_err(swift_purge_refusal)?;
 
     // Prefer the explicit X-Swift-Package-Manifest header (lets clients override
     // what's inside the archive), and fall back to parsing Package.swift from

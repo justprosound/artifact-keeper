@@ -499,7 +499,15 @@ async fn upload_cookbook(
         return Err(super::immutable_release("Cookbook version already exists"));
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::purge_tombstone_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Chef,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Staged(&staged),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     // Stream the staged tarball into the repo's StorageBackend via `put_stream`,
     // which computes the SHA-256 incrementally as it copies (no re-hash).

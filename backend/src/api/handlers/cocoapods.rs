@@ -615,7 +615,15 @@ async fn push_pod(
     )
     .await?;
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::purge_tombstone_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Cocoapods,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Known(&computed_sha256),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
     // Store the pod archive
     let storage_key = build_cocoapods_storage_key(pod_name, pod_version);
     proxy_helpers::guard_cross_repo_write(&state, repo.id, &repo.storage_backend, &storage_key)
