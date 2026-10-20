@@ -5791,7 +5791,7 @@ async fn store_npm_version(
     .map_err(map_db_err)?;
 
     if existing.is_some() {
-        return Err(AppError::Conflict(format!(
+        return Err(AppError::Immutable(format!(
             "Version {} of {} already exists",
             ver.version, package_name
         ))

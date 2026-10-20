@@ -602,7 +602,7 @@ async fn push_pod(
     .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Pod version already exists").into_response());
+        return Err(super::immutable_release("Pod version already exists"));
     }
 
     // Refuse an over-quota upload before a soft-deleted row at this path is

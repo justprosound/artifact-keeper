@@ -1649,11 +1649,10 @@ async fn upload_module(
     })?;
 
     if existing.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("Module {} version {} already exists", module_name, version),
-        )
-            .into_response());
+        return Err(super::immutable_release(format!(
+            "Module {} version {} already exists",
+            module_name, version
+        )));
     }
 
     // Stream the request body to a bounded scratch file, computing the content
@@ -2399,14 +2398,10 @@ async fn upload_provider(
     })?;
 
     if existing.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "Provider {} version {} for {} already exists",
-                provider_name, version, platform
-            ),
-        )
-            .into_response());
+        return Err(super::immutable_release(format!(
+            "Provider {} version {} for {} already exists",
+            provider_name, version, platform
+        )));
     }
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;

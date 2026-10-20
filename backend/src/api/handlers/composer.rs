@@ -1709,11 +1709,10 @@ async fn upload(
     })?;
 
     if existing.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("Version {} of {} already exists", version, full_name),
-        )
-            .into_response());
+        return Err(super::immutable_release(format!(
+            "Version {} of {} already exists",
+            version, full_name
+        )));
     }
 
     super::cleanup_soft_deleted_artifact_checked(

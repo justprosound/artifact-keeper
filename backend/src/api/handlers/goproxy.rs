@@ -1585,11 +1585,10 @@ async fn upload_zip(
     })?;
 
     if existing.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("Module zip {}@{} already exists", module, version),
-        )
-            .into_response());
+        return Err(super::immutable_release(format!(
+            "Module zip {}@{} already exists",
+            module, version
+        )));
     }
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
@@ -1754,11 +1753,10 @@ async fn upload_mod(
     })?;
 
     if existing.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("go.mod for {}@{} already exists", module, version),
-        )
-            .into_response());
+        return Err(super::immutable_release(format!(
+            "go.mod for {}@{} already exists",
+            module, version
+        )));
     }
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;

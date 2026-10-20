@@ -722,11 +722,7 @@ async fn upload_package(
     .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
-        return Err(pub_error_response(
-            StatusCode::CONFLICT,
-            "CONFLICT",
-            "Package version already exists",
-        ));
+        return Err(pub_immutable_response("Package version already exists"));
     }
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
@@ -885,6 +881,16 @@ async fn finalize_upload(
 
 /// Build a Pub-spec JSON error response: `{"error": {"code": "...", "message": "..."}}`
 #[allow(clippy::result_large_err)]
+/// The release-immutability 409 (#5) in pub's `{"error": {code, message}}`
+/// envelope, with the stable code as `error.code`.
+pub(super) fn pub_immutable_response(message: &str) -> Response {
+    pub_error_response(
+        StatusCode::CONFLICT,
+        crate::error::IMMUTABLE_RELEASE_CODE,
+        message,
+    )
+}
+
 fn pub_error_response(status: StatusCode, code: &str, message: &str) -> Response {
     let json = serde_json::json!({
         "error": {

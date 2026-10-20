@@ -8123,8 +8123,8 @@ pub async fn insert_artifact_row(
 /// Reject if `(repository_id, path)` already exists, otherwise sweep any
 /// soft-deleted row at that path so a subsequent INSERT can proceed.
 ///
-/// `conflict_message` is the human-readable error returned on a 409
-/// (e.g. "Module version already exists").
+/// `conflict_message` is the human-readable message of the
+/// `IMMUTABLE_RELEASE` 409 (e.g. "Module version already exists").
 #[allow(clippy::result_large_err)]
 pub async fn ensure_unique_artifact_path(
     db: &PgPool,
@@ -8142,7 +8142,7 @@ pub async fn ensure_unique_artifact_path(
     .map_err(|e| internal_error("Database", e))?;
 
     if existing.is_some() {
-        return Err((StatusCode::CONFLICT, conflict_message.to_string()).into_response());
+        return Err(AppError::Immutable(conflict_message.to_string()).into_response());
     }
 
     super::cleanup_soft_deleted_artifact(db, repo_id, artifact_path).await;
@@ -16164,6 +16164,14 @@ mod tests {
         .await
         .expect_err("conflict expected");
         assert_eq!(err.status(), StatusCode::CONFLICT);
+        // #5: the live-republish refusal carries the stable immutability code,
+        // not a plain-text body a client could only match on.
+        let body = axum::body::to_bytes(err.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE);
+        assert_eq!(json["message"], "Collection version already exists");
 
         db_helpers::cleanup(&pool, repo_id, user_id).await;
     }

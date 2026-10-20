@@ -4383,7 +4383,7 @@ async fn publish_extension(
     .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Extension version already exists").into_response());
+        return Err(super::immutable_release("Extension version already exists"));
     }
 
     // Refuse an over-quota upload before a soft-deleted row at this path is

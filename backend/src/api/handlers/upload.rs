@@ -541,7 +541,7 @@ async fn get_session_status(
             (1) Checksum mismatch: the assembled file's SHA-256 differs from the checksum declared when the session was created. \
             The body is `{\"error\": \"checksum mismatch: expected <sha256>, got <sha256>\"}`; the session is failed, so re-upload in a new session. \
             (2) Immutable path occupied (#3924): an artifact already exists at this path and may not be overwritten. \
-            The body is `{\"code\": \"CONFLICT\", \"message\": \"Artifact version already exists and is immutable\"}`; no bytes are written and the session stays open, \
+            The body is `{\"code\": \"IMMUTABLE_RELEASE\", \"message\": \"Artifact version already exists and is immutable\"}`; no bytes are written and the session stays open, \
             so this request can be repeated once the occupying artifact is deleted.", body = crate::api::openapi::ErrorResponse),
         (status = 410, description = "Session expired, or created by an earlier server version and not resumable; start a new session", body = crate::api::openapi::ErrorResponse),
         (status = 503, description = "Staging storage or database temporarily unavailable; the session is left completable, retry (honour Retry-After)", body = crate::api::openapi::ErrorResponse),
@@ -4686,6 +4686,8 @@ mod tests {
              silent overwrite: {}",
             String::from_utf8_lossy(&body)
         );
+        let refusal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(refusal["code"], crate::error::IMMUTABLE_RELEASE_CODE);
 
         let stored: String = sqlx::query_scalar(
             "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",
@@ -4741,6 +4743,8 @@ mod tests {
              the single-PUT path, so the chunked path must agree: {}",
             String::from_utf8_lossy(&body)
         );
+        let refusal: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(refusal["code"], crate::error::IMMUTABLE_RELEASE_CODE);
 
         cleanup_staged_session(&f, first_session, &first_temp).await;
         cleanup_staged_session(&f, second_session, &second_temp).await;

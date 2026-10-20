@@ -9564,6 +9564,9 @@ pub async fn list_artifact_versions(
         (status = 403, description = "Not authorized to write to this repository", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found"),
         (status = 405, description = "Repository is remote (proxy); direct uploads are not accepted", body = crate::api::openapi::ErrorResponse),
+        (status = 409, description = "Release immutability (#5): an artifact already exists at this path and is immutable, or a deleted release is being re-uploaded with different bytes. \
+            The body is `{\"code\": \"IMMUTABLE_RELEASE\", \"message\": \"Artifact version already exists and is immutable\"}`; nothing is written. \
+            Any other 409 (code `CONFLICT`) is not an immutability refusal.", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn upload_artifact(
@@ -11376,7 +11379,7 @@ pub struct DeleteArtifactQuery {
         (status = 401, description = "Authentication required"),
         (status = 403, description = "`permanent=true` requires an admin"),
         (status = 404, description = "Artifact not found"),
-        (status = 409, description = "Artifact is immutable (released) and cannot be deleted, or `permanent=true` on an OCI repository"),
+        (status = 409, description = "Artifact is immutable (released) and cannot be deleted (code `IMMUTABLE_RELEASE`), or `permanent=true` on an OCI repository (code `CONFLICT`)", body = crate::api::openapi::ErrorResponse),
     )
 )]
 pub async fn delete_artifact(
@@ -11454,7 +11457,7 @@ pub async fn delete_artifact(
     let replication_trusted =
         replication_exemption_trusted(is_replication, auth.is_admin, auth.is_service_account);
     if delete_blocked_by_immutability(&repo.format, &path, auth.is_admin, replication_trusted) {
-        return Err(AppError::Conflict(
+        return Err(AppError::Immutable(
             "Cannot delete an immutable/released artifact".to_string(),
         ));
     }

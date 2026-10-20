@@ -173,7 +173,7 @@ pub(crate) async fn enforce_path_immutability(
 
     if let Some(existing) = existing {
         if !versioning_active && existing.version == version.map(String::from) {
-            return Err(AppError::Conflict(
+            return Err(AppError::Immutable(
                 "Artifact version already exists and is immutable".to_string(),
             ));
         }
@@ -207,7 +207,7 @@ pub(crate) async fn enforce_path_immutability(
         let is_released = prior.version.is_some()
             || crate::services::cache_classifier::classify(&repo.format, path).is_immutable();
         if is_released && !prior.checksum_sha256.eq_ignore_ascii_case(checksum_sha256) {
-            return Err(AppError::Conflict(
+            return Err(AppError::Immutable(
                 "Artifact version already exists and is immutable".to_string(),
             ));
         }
@@ -4637,7 +4637,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(swap, Err(AppError::Conflict(_))),
+            matches!(swap, Err(AppError::Immutable(_))),
             "pool/ coordinate is a release coordinate: tombstone + different-bytes re-push must be rejected, got {:?}",
             swap.map(|a| a.path)
         );
@@ -4673,7 +4673,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(swap, Err(AppError::Conflict(_))),
+            matches!(swap, Err(AppError::Immutable(_))),
             "by-hash/ coordinate is content-addressed: tombstone + different-bytes re-push must be rejected, got {:?}",
             swap.map(|a| a.path)
         );
@@ -5364,7 +5364,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(swap, Err(AppError::Conflict(_))),
+            matches!(swap, Err(AppError::Immutable(_))),
             "flag-off different-bytes re-upload to a released coordinate must still 409, got {:?}",
             swap.map(|a| a.path)
         );

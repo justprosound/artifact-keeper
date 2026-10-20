@@ -3920,7 +3920,7 @@ async fn persist_debian_upload(
     .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Package already exists").into_response());
+        return Err(super::immutable_release("Package already exists"));
     }
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &upload.artifact_path).await;

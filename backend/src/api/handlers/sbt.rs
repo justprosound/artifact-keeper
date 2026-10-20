@@ -540,7 +540,9 @@ async fn upload_artifact(
     .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Artifact already exists at this path").into_response());
+        return Err(super::immutable_release(
+            "Artifact already exists at this path",
+        ));
     }
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;

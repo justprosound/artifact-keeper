@@ -8512,7 +8512,7 @@ async fn store_conda_package(
     })?;
 
     if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Package already exists").into_response());
+        return Err(super::immutable_release("Package already exists"));
     }
 
     super::cleanup_soft_deleted_artifact_checked(

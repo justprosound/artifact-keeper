@@ -1689,20 +1689,29 @@ async fn check_duplicate_crate(
     .map_err(map_db_err)?;
 
     if existing.is_some() {
-        return Err(Response::builder()
-            .status(StatusCode::CONFLICT)
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::json!({"errors": [{"detail": format!(
-                    "crate version `{}@{}` already exists",
-                    name, version
-                )}]})
-                .to_string(),
-            ))
-            .unwrap());
+        return Err(cargo_immutable_response(&format!(
+            "crate version `{}@{}` already exists",
+            name, version
+        )));
     }
 
     Ok(())
+}
+
+/// A release-immutability refusal (#5) in cargo's own `errors` envelope,
+/// which `cargo publish` reads `detail` from, with the stable code beside it.
+pub(super) fn cargo_immutable_response(detail: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::CONFLICT)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({"errors": [{
+                "detail": detail,
+                "code": crate::error::IMMUTABLE_RELEASE_CODE,
+            }]})
+            .to_string(),
+        ))
+        .unwrap()
 }
 
 /// Store the .crate file and insert artifact + metadata records into the database.
@@ -1761,7 +1770,10 @@ async fn store_crate_artifact(
         checksum,
     )
     .await
-    .map_err(|e| e.into_response())?;
+    .map_err(|e| match e {
+        AppError::Immutable(detail) => cargo_immutable_response(&detail),
+        other => other.into_response(),
+    })?;
 
     let mut tx = super::publish_quota::begin_admitted_publish(
         &state.db,

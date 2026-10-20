@@ -1540,7 +1540,7 @@ async fn store_apk(
     .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Package already exists").into_response());
+        return Err(super::immutable_release("Package already exists"));
     }
 
     // Refuse an over-quota upload before a soft-deleted row at this path is

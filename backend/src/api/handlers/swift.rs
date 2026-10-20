@@ -199,17 +199,26 @@ fn swift_json_response(status: StatusCode, body: serde_json::Value) -> Response 
 /// pool or an unreachable database) carries `Retry-After` like every other
 /// format's envelope (#4765).
 fn swift_error_response(status: StatusCode, detail: &str) -> Response {
+    swift_problem_response(status, serde_json::json!({ "detail": detail }))
+}
+
+/// The release-immutability 409 (#5): the registry's problem+json body with
+/// the stable `code` as an RFC 7807 extension member, so SwiftPM still reads
+/// `detail` and other clients can match on the code.
+pub(super) fn swift_immutable_response(detail: &str) -> Response {
+    swift_problem_response(
+        StatusCode::CONFLICT,
+        serde_json::json!({ "detail": detail, "code": crate::error::IMMUTABLE_RELEASE_CODE }),
+    )
+}
+
+fn swift_problem_response(status: StatusCode, problem: serde_json::Value) -> Response {
     super::with_retry_after_on_503(
         Response::builder()
             .status(status)
             .header(CONTENT_TYPE, "application/problem+json")
             .header("Content-Version", "1")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({
-                    "detail": detail,
-                }))
-                .unwrap(),
-            ))
+            .body(Body::from(serde_json::to_string(&problem).unwrap()))
             .unwrap(),
     )
 }
@@ -1076,8 +1085,7 @@ async fn publish_release(
     })?;
 
     if existing.is_some() {
-        return Err(swift_error_response(
-            StatusCode::CONFLICT,
+        return Err(swift_immutable_response(
             "A release with this version already exists",
         ));
     }

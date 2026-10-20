@@ -489,7 +489,7 @@ async fn test_reupload_rejected_as_immutable_keeps_stored_checksums() {
         .await
         .expect_err("re-upload of an existing version must be rejected");
     assert!(
-        matches!(&err, AppError::Conflict(msg) if msg.contains("already exists and is immutable")),
+        matches!(&err, AppError::Immutable(msg) if msg.contains("already exists and is immutable")),
         "expected an immutable-version Conflict, got {err:?}",
     );
 

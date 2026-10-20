@@ -56,6 +56,16 @@ pub(crate) async fn queue_push_sync_tasks_now(
         .await;
 }
 
+/// The `409 IMMUTABLE_RELEASE` response (#5) a format handler returns when a
+/// publish would overwrite a released coordinate. Handlers that answer in
+/// `Result<_, Response>` use this instead of a plain-text 409, so every
+/// immutability refusal carries the same machine-readable code; formats with
+/// their own error envelope (cargo, pub, swift) put the same code inside it.
+pub(crate) fn immutable_release(message: impl Into<String>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    crate::error::AppError::Immutable(message.into()).into_response()
+}
+
 /// Remove any soft-deleted artifact at the given `(repository_id, path)` so
 /// that a subsequent INSERT won't violate the UNIQUE constraint.  This is a
 /// fire-and-forget cleanup: if the DELETE fails or finds nothing we just
@@ -125,7 +135,7 @@ pub async fn cleanup_soft_deleted_artifact_checked(
                     .checksum_sha256
                     .eq_ignore_ascii_case(new_checksum_sha256)
             {
-                return Err(AppError::Conflict(
+                return Err(AppError::Immutable(
                     "Artifact version already exists and is immutable".to_string(),
                 ));
             }
@@ -1089,7 +1099,7 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(res, Err(crate::error::AppError::Conflict(_))),
+            matches!(res, Err(crate::error::AppError::Immutable(_))),
             "delete + re-upload of different bytes to an immutable Maven coordinate must 409",
         );
         // Tombstone must still be present (purge refused).
@@ -1278,6 +1288,71 @@ mod tests {
         assert!(res.is_ok(), "first upload with no tombstone must proceed");
 
         cleanup_repo(&pool, repo).await;
+    }
+}
+
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod immutable_release_envelope_tests {
+    use crate::error::IMMUTABLE_RELEASE_CODE;
+    use axum::http::StatusCode;
+    use axum::response::Response;
+
+    /// #5: every format's release-immutability refusal is a 409 that carries
+    /// the stable code, inside the envelope that format's clients parse,
+    /// next to the unchanged human-readable message.
+    #[tokio::test]
+    async fn every_format_envelope_carries_the_stable_code() {
+        // (label, response, JSON pointer of the code, JSON pointer of the message)
+        let cases: Vec<(&str, Response, &str, &str)> = vec![
+            (
+                "shared AppError body (REST, helm, debian, rpm, ...)",
+                super::immutable_release("Chart demo version 1.0.0 already exists"),
+                "/code",
+                "/message",
+            ),
+            (
+                "cargo `errors`",
+                super::cargo::cargo_immutable_response("crate version `demo@1.0.0` already exists"),
+                "/errors/0/code",
+                "/errors/0/detail",
+            ),
+            (
+                "pub `error`",
+                super::pub_registry::pub_immutable_response("Package version already exists"),
+                "/error/code",
+                "/error/message",
+            ),
+            (
+                "swift problem+json",
+                super::swift::swift_immutable_response(
+                    "A release with this version already exists",
+                ),
+                "/code",
+                "/detail",
+            ),
+        ];
+        for (label, response, code_at, message_at) in cases {
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{label}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|e| panic!("{label}: body is not JSON ({e})"));
+            assert_eq!(
+                json.pointer(code_at).and_then(|v| v.as_str()),
+                Some(IMMUTABLE_RELEASE_CODE),
+                "{label}: {json}"
+            );
+            assert!(
+                json.pointer(message_at)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|m| m.contains("already exists")),
+                "{label}: the message must survive unchanged: {json}"
+            );
+        }
     }
 }
 

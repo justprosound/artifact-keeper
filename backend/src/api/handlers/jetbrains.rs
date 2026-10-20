@@ -431,7 +431,7 @@ async fn upload_plugin(
     .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Plugin version already exists").into_response());
+        return Err(super::immutable_release("Plugin version already exists"));
     }
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
