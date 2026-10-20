@@ -181,7 +181,9 @@ pub(crate) async fn enforce_path_immutability(
 
     // (2) release-immutability backstop
     match repo {
-        Some(repo) => refuse_released_byte_swap(db, repository_id, repo, path, checksum_sha256).await,
+        Some(repo) => {
+            refuse_released_byte_swap(db, repository_id, repo, path, checksum_sha256).await
+        }
         None => Ok(()),
     }
 }

@@ -9638,7 +9638,11 @@ mod tests {
         assert_eq!(run.counts, (0, 0, 1), "a conflict is skipped, not failed");
         assert_eq!(run.item.0, "skipped");
         assert!(
-            run.item.1.as_deref().unwrap_or_default().contains("immutable"),
+            run.item
+                .1
+                .as_deref()
+                .unwrap_or_default()
+                .contains("immutable"),
             "the item must say why it was refused; got {:?}",
             run.item.1
         );
