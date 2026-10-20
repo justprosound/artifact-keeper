@@ -6786,6 +6786,53 @@ mod upload_db_tests {
         std::fs::write(&file, b"plain text, not a package").unwrap();
         assert!(read_deb_head(&file).await.is_err());
     }
+
+    /// #5: re-uploading a released `.deb` with different bytes is refused 409
+    /// with the stable `IMMUTABLE_RELEASE` code.
+    #[tokio::test]
+    async fn pool_republish_with_different_bytes_is_immutable_release_5() {
+        let Some(f) = tdh::Fixture::setup("local", "debian").await else {
+            return;
+        };
+        let (package, version, arch) = ("ak-debian-frozen", "1.0.0-1", "amd64");
+        let uri = format!(
+            "/{}/pool/main/a/{package}/{package}_{version}_{arch}.deb",
+            f.repo_key
+        );
+        let first = tdh::send(
+            f.router_with_auth(super::router()),
+            tdh::put(
+                uri.clone(),
+                Bytes::from(minimal_deb(package, version, arch, "first build")),
+            ),
+        )
+        .await;
+        let (status, body) = tdh::send(
+            f.router_with_auth(super::router()),
+            tdh::put(
+                uri,
+                Bytes::from(minimal_deb(package, version, arch, "other build")),
+            ),
+        )
+        .await;
+        f.teardown().await;
+
+        assert_eq!(
+            first.0,
+            StatusCode::CREATED,
+            "first upload: {}",
+            String::from_utf8_lossy(&first.1)
+        );
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "re-upload: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE, "{json}");
+    }
 }
 
 // ---------------------------------------------------------------------------

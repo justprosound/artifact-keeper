@@ -31607,6 +31607,49 @@ mod tests {
             "the REPOSITORY_CREATED row must carry the request peer IP (#4762)"
         );
     }
+
+    /// #5: a non-admin DELETE of a released (versioned) Maven coordinate is
+    /// refused 409 with the stable `IMMUTABLE_RELEASE` code, so a client can
+    /// tell it from the OCI `permanent=true` refusal (code `CONFLICT`). The
+    /// gate sits before the artifact lookup, so no prior upload is needed.
+    #[tokio::test]
+    async fn delete_of_a_released_coordinate_is_immutable_release_5() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, key, dir) = tdh::create_repo(&pool, "local", "maven").await;
+        tdh::grant_repo_access(&pool, repo_id, user_id).await;
+        tdh::grant_repo_actions(&pool, repo_id, user_id, &["read", "write", "delete"]).await;
+        let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+
+        let del = delete_artifact(
+            State(state),
+            Extension(Some(tdh::make_auth(user_id, &username))),
+            Path((key, "com/acme/frozen/1.0.0/frozen-1.0.0.jar".to_string())),
+            Query(DeleteArtifactQuery::default()),
+            HeaderMap::new(),
+        )
+        .await;
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let err = del.expect_err("a non-admin delete of a released coordinate must be refused");
+        assert!(
+            matches!(err, AppError::Immutable(_)),
+            "the refusal must be AppError::Immutable, got {err:?}"
+        );
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE, "{json}");
+    }
 }
 
 // --------------------------------------------------------------------------

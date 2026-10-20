@@ -3847,4 +3847,41 @@ mod catalog_registration_tests {
         assert_eq!(row.version, "1.0-r0");
         assert_eq!(row.versions, vec!["1.0-r0".to_string()]);
     }
+
+    /// #5: re-uploading a released `.apk` with different bytes is refused 409
+    /// with the stable `IMMUTABLE_RELEASE` code.
+    #[tokio::test]
+    async fn apk_republish_with_different_bytes_is_immutable_release_5() {
+        let Some(fx) = tdh::Fixture::setup("local", "alpine").await else {
+            return;
+        };
+        let uri = format!("/{}/v3.21/main/aarch64/dtf-marker-1.0-r0.apk", fx.repo_key);
+        let first = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(uri.clone(), bytes::Bytes::from_static(super::MARKER_APK)),
+        )
+        .await;
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(uri, bytes::Bytes::from_static(b"other-apk-bytes")),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            first.0,
+            axum::http::StatusCode::CREATED,
+            "first upload: {}",
+            String::from_utf8_lossy(&first.1)
+        );
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "re-upload: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE, "{json}");
+    }
 }

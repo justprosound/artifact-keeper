@@ -1646,4 +1646,49 @@ mod catalog_registration_tests {
         assert_eq!(row.version, "2.4.1");
         assert_eq!(row.versions, vec!["2.4.1".to_string()]);
     }
+
+    /// #5: re-uploading a released plugin version with different bytes is
+    /// refused 409 with the stable `IMMUTABLE_RELEASE` code.
+    #[tokio::test]
+    async fn republish_of_a_released_plugin_version_is_immutable_release_5() {
+        let Some(fx) = tdh::Fixture::setup("local", "jetbrains").await else {
+            return;
+        };
+        let upload = |bytes: &'static str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{}/plugin/uploadPlugin", fx.repo_key))
+                .header("x-plugin-name", "com.example.frozen")
+                .header("x-plugin-version", "1.0.0")
+                .body(axum::body::Body::from(bytes))
+                .unwrap()
+        };
+        let first = tdh::send(
+            fx.router_with_auth(super::router()),
+            upload("first-plugin-bytes"),
+        )
+        .await;
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            upload("other-plugin-bytes"),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert!(
+            first.0.is_success(),
+            "first upload: {} {}",
+            first.0,
+            String::from_utf8_lossy(&first.1)
+        );
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "re-upload: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE, "{json}");
+    }
 }

@@ -16068,6 +16068,61 @@ mod tests {
         // request was answered from cache.
         fx.teardown().await;
     }
+
+    /// #5: publishing a version that is already live is refused 409 with the
+    /// stable `IMMUTABLE_RELEASE` code, not the generic `CONFLICT`.
+    #[tokio::test]
+    async fn test_republish_of_a_live_version_is_immutable_release_5() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let publish_body = |tarball: &[u8]| {
+            let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(tarball);
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "frozen",
+                    "versions": { "1.0.0": { "name": "frozen", "version": "1.0.0" } },
+                    "_attachments": { "frozen-1.0.0.tgz": { "data": tarball_b64 } },
+                }))
+                .expect("serialize publish body"),
+            )
+        };
+        let first = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "frozen",
+            &HeaderMap::new(),
+            publish_body(b"first-tgz"),
+        )
+        .await;
+        let second = super::publish_package(
+            &fx.state,
+            Some(tdh::make_auth(fx.user_id, &fx.username)),
+            &fx.repo_key,
+            "frozen",
+            &HeaderMap::new(),
+            publish_body(b"other-tgz"),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert!(
+            first.is_ok(),
+            "first publish must succeed: {:?}",
+            first.err().map(|r| r.status())
+        );
+        let err = second.expect_err("republishing a live version must be refused");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(err.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE, "{json}");
+    }
 }
 
 #[allow(clippy::disallowed_methods)]

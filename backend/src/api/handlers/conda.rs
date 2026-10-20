@@ -16672,6 +16672,48 @@ mod catalog_registration_tests {
             Some("a catalogued conda package")
         );
     }
+
+    /// #5: uploading a package filename that is already live is refused 409
+    /// with the stable `IMMUTABLE_RELEASE` code. The live check is keyed on
+    /// the path alone, so the second upload reuses the same archive.
+    #[tokio::test]
+    async fn reupload_of_a_live_package_is_immutable_release_5() {
+        let Some(fx) = tdh::Fixture::setup("local", "conda").await else {
+            return;
+        };
+        let upload = || {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{}/upload", fx.repo_key))
+                .header("X-Conda-Subdir", "noarch")
+                .header("X-Package-Filename", "frozenpkg-1.0.0-py39_0.tar.bz2")
+                .body(axum::body::Body::from(conda_v1_package(
+                    "frozenpkg",
+                    "1.0.0",
+                    "py39_0",
+                )))
+                .unwrap()
+        };
+        let first = tdh::send(fx.router_with_auth(super::router()), upload()).await;
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), upload()).await;
+        fx.teardown().await;
+
+        assert!(
+            first.0.is_success(),
+            "first upload: {} {}",
+            first.0,
+            String::from_utf8_lossy(&first.1)
+        );
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "re-upload: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE, "{json}");
+    }
 }
 
 // ---------------------------------------------------------------------------

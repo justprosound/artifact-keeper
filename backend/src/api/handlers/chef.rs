@@ -1152,6 +1152,49 @@ mod upload_stream_tests {
             "only the client upload queues a push task; the replicated one must not"
         );
     }
+
+    /// #5: re-uploading a released cookbook version with different bytes is
+    /// refused 409 with the stable `IMMUTABLE_RELEASE` code.
+    #[tokio::test]
+    async fn test_chef_republish_of_a_released_version_is_immutable_release_5() {
+        let Some(fx) = tdh::Fixture::setup("local", "chef").await else {
+            return;
+        };
+        let upload = |tarball: &[u8]| {
+            tdh::post(
+                format!("/{}/api/v1/cookbooks", fx.repo_key),
+                "multipart/form-data; boundary=CHEFBND",
+                cookbook_multipart("CHEFBND", "frozen", "1.0.0", tarball),
+            )
+        };
+        let first = tdh::send(
+            fx.router_with_auth(super::router()),
+            upload(b"first-tarball"),
+        )
+        .await;
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            upload(b"other-tarball"),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            first.0,
+            StatusCode::CREATED,
+            "first upload: {}",
+            String::from_utf8_lossy(&first.1)
+        );
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "re-upload: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE, "{json}");
+    }
 }
 
 // ---------------------------------------------------------------------------

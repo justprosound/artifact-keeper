@@ -10111,6 +10111,52 @@ mod catalog_registration_tests {
             "only the client publish queues a push task; the replicated one must not"
         );
     }
+
+    /// #5: publishing an extension version that is already live is refused
+    /// 409 with the stable `IMMUTABLE_RELEASE` code.
+    #[tokio::test]
+    async fn republish_of_a_live_extension_version_is_immutable_release_5() {
+        let Some(fx) = tdh::Fixture::setup("local", "vscode").await else {
+            return;
+        };
+        let publish = |bytes: &'static str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{}/api/extensions", fx.repo_key))
+                .header("x-publisher", "acme")
+                .header("x-extension-name", "frozen")
+                .header("x-extension-version", "1.0.0")
+                .body(axum::body::Body::from(bytes))
+                .unwrap()
+        };
+        let first = tdh::send(
+            fx.router_with_auth(super::router()),
+            publish("first-vsix-bytes"),
+        )
+        .await;
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            publish("other-vsix-bytes"),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert!(
+            first.0.is_success(),
+            "first publish: {} {}",
+            first.0,
+            String::from_utf8_lossy(&first.1)
+        );
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "republish: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE, "{json}");
+    }
 }
 
 // ---------------------------------------------------------------------------
