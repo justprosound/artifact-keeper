@@ -1626,19 +1626,25 @@ mod db_tests {
         assert_eq!(deleted, signed);
         assert_eq!(renders(), 3);
 
-        // Re-uploading the same version with different content is a new
-        // artifact (the soft-deleted row and its list are swept first), so it
-        // renders again and lists the new file.
+        // The deleted version stays a release (#2): different content at the
+        // same version is refused, and nothing is re-rendered.
         let (again_file, again_pkg) =
             build_package_with("tool", "1.0-1", "x86_64", "usr/bin/tool2");
         assert_eq!(again_file, tool_file);
-        assert_eq!(put(&fx, &again_file, again_pkg).await, StatusCode::CREATED);
+        assert_eq!(put(&fx, &again_file, again_pkg).await, StatusCode::CONFLICT);
+        assert_eq!(renders(), 3);
+
+        // Re-uploading the identical package is a new artifact (the
+        // soft-deleted row and its list are swept first), so it renders again
+        // and lists its file.
+        let (_, same_pkg) = build_package("tool", "1.0-1", "x86_64");
+        assert_eq!(put(&fx, &tool_file, same_pkg).await, StatusCode::CREATED);
         let (_, reuploaded) = get(&fx, "x86_64/myrepo.files").await;
         let tool = db_members(&reuploaded)
             .into_iter()
             .find(|(p, _)| p == "tool-1.0-1/files")
             .expect("re-uploaded package listed");
-        assert_eq!(tool.1, "%FILES%\nusr/bin/tool2\n");
+        assert_eq!(tool.1, "%FILES%\nusr/bin/tool\n");
         assert_eq!(renders(), 4);
         fx.teardown().await;
     }
