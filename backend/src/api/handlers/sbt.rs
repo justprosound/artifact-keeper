@@ -1648,3 +1648,84 @@ mod serve_key_4365_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// #2: a deleted release coordinate must not reopen for different bytes.
+// ---------------------------------------------------------------------------
+
+#[cfg(ak_test_shard = "handlers-2")]
+#[cfg(test)]
+mod release_tombstone_tests {
+    use crate::api::handlers::test_db_helpers as tdh;
+    use axum::http::StatusCode;
+
+    const JAR_PATH: &str = "com.example/imm-lib/1.0.0/jars/imm-lib-1.0.0.jar";
+
+    async fn put_jar(fx: &tdh::Fixture, bytes: &'static [u8]) -> (StatusCode, bytes::Bytes) {
+        tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                format!("/{}/{JAR_PATH}", fx.repo_key),
+                bytes::Bytes::from_static(bytes),
+            ),
+        )
+        .await
+    }
+
+    /// Soft-delete the jar the way the artifact DELETE API does: the row stays
+    /// as a tombstone (`is_deleted = true`) carrying the released checksum.
+    async fn soft_delete_jar(fx: &tdh::Fixture) {
+        sqlx::query(
+            "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(JAR_PATH)
+        .execute(&fx.pool)
+        .await
+        .expect("soft-delete jar");
+    }
+
+    /// #2: sbt purged the tombstone unchecked, so delete + re-PUT swapped the
+    /// bytes behind a released Ivy revision.
+    #[tokio::test]
+    async fn sbt_reupload_different_bytes_after_delete_is_immutable_2() {
+        let Some(fx) = tdh::Fixture::setup("local", "sbt").await else {
+            return;
+        };
+        let (status, _) = put_jar(&fx, b"original-jar-bytes").await;
+        assert!(status.is_success(), "first publish failed: {status}");
+        soft_delete_jar(&fx).await;
+
+        let (status, body) = put_jar(&fx, b"swapped-jar-bytes").await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "re-PUT of different bytes under a deleted release must 409; body {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("structured 409");
+        assert_eq!(json["code"], "IMMUTABLE_RELEASE");
+
+        fx.teardown().await;
+    }
+
+    /// #2: the identical bytes may still be re-PUT after a delete.
+    #[tokio::test]
+    async fn sbt_reupload_identical_bytes_after_delete_is_allowed_2() {
+        let Some(fx) = tdh::Fixture::setup("local", "sbt").await else {
+            return;
+        };
+        let (status, _) = put_jar(&fx, b"original-jar-bytes").await;
+        assert!(status.is_success(), "first publish failed: {status}");
+        soft_delete_jar(&fx).await;
+
+        let (status, body) = put_jar(&fx, b"original-jar-bytes").await;
+        assert!(
+            status.is_success(),
+            "re-PUT of the identical bytes must succeed: {status} {:?}",
+            String::from_utf8_lossy(&body)
+        );
+
+        fx.teardown().await;
+    }
+}
