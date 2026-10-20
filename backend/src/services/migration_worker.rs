@@ -1979,7 +1979,7 @@ impl MigrationWorker {
         .await
         {
             Ok(()) => Ok(()),
-            Err(crate::error::AppError::Conflict(_)) => {
+            Err(crate::error::AppError::Immutable(_)) => {
                 Err(MigrationError::ReleaseImmutable(path.to_string()))
             }
             Err(e) => Err(MigrationError::Other(e.to_string())),
