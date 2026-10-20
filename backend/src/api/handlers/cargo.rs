@@ -6714,6 +6714,108 @@ mod tests {
             "only the client publish queues a push task; the replicated one must not"
         );
     }
+
+    /// Assert a cargo `errors` envelope refusing a release-immutable publish
+    /// (#5): 409, cargo's `detail`, and the stable code beside it.
+    fn assert_cargo_immutable(status: StatusCode, body: &[u8], what: &str) {
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{what}: {}",
+            String::from_utf8_lossy(body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(body)
+            .unwrap_or_else(|e| panic!("{what}: body is not JSON ({e})"));
+        assert_eq!(
+            json["errors"][0]["code"],
+            crate::error::IMMUTABLE_RELEASE_CODE,
+            "{what}: {json}"
+        );
+        assert!(
+            json["errors"][0]["detail"].is_string(),
+            "{what}: cargo reads `detail`: {json}"
+        );
+    }
+
+    /// #5: publishing a crate version that is already live is refused with
+    /// the stable `IMMUTABLE_RELEASE` code inside cargo's `errors` envelope.
+    #[tokio::test]
+    async fn test_republish_of_a_live_version_is_immutable_release_5() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+        let uri = format!("/{}/api/v1/crates/new", fx.repo_key);
+        let first = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                uri.clone(),
+                make_publish_payload(&sample_metadata(), b"first-crate-bytes"),
+            ),
+        )
+        .await;
+        let second = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                uri,
+                make_publish_payload(&sample_metadata(), b"other-crate-bytes"),
+            ),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            first.0,
+            StatusCode::OK,
+            "first publish: {}",
+            String::from_utf8_lossy(&first.1)
+        );
+        assert_cargo_immutable(second.0, &second.1, "republish of a live version");
+    }
+
+    /// #5: a yanked-and-deleted (soft-deleted) crate version cannot be
+    /// re-published with different bytes either; the tombstone check answers
+    /// in cargo's own envelope with the stable code, not the shared body.
+    #[tokio::test]
+    async fn test_republish_over_a_tombstone_is_immutable_release_5() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+        let uri = format!("/{}/api/v1/crates/new", fx.repo_key);
+        let first = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                uri.clone(),
+                make_publish_payload(&sample_metadata(), b"first-crate-bytes"),
+            ),
+        )
+        .await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("soft-delete the published crate");
+        let second = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                uri,
+                make_publish_payload(&sample_metadata(), b"other-crate-bytes"),
+            ),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            first.0,
+            StatusCode::OK,
+            "first publish: {}",
+            String::from_utf8_lossy(&first.1)
+        );
+        assert_cargo_immutable(second.0, &second.1, "republish over a tombstone");
+    }
 }
 
 /// #3149 — upstream `Content-Encoding` forwarding on the cargo SPARSE INDEX.

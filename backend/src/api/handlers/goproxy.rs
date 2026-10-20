@@ -4013,4 +4013,57 @@ mod catalog_registration_tests {
             );
         }
     }
+
+    /// #5: re-uploading a released module zip or go.mod with different bytes
+    /// is refused 409 with the stable `IMMUTABLE_RELEASE` code.
+    #[tokio::test]
+    async fn republishing_a_released_zip_or_mod_is_immutable_release_5() {
+        let Some(fx) = tdh::Fixture::setup("local", "go").await else {
+            return;
+        };
+        let router = fx.router_with_auth(super::router());
+        let mut results = Vec::new();
+        for file in ["v1.0.0.zip", "v1.0.0.mod"] {
+            let uri = format!("/{}/example.com/frozen/@v/{file}", fx.repo_key);
+            let first = tdh::send(
+                router.clone(),
+                tdh::put(
+                    uri.clone(),
+                    bytes::Bytes::from_static(b"module example.com/frozen\n"),
+                ),
+            )
+            .await;
+            let second = tdh::send(
+                router.clone(),
+                tdh::put(
+                    uri,
+                    bytes::Bytes::from_static(b"module example.com/frozen\n\ngo 1.22\n"),
+                ),
+            )
+            .await;
+            results.push((file, first, second));
+        }
+        fx.teardown().await;
+
+        for (file, (first_status, first_body), (status, body)) in results {
+            assert!(
+                first_status.is_success(),
+                "first upload of {file}: {first_status} {}",
+                String::from_utf8_lossy(&first_body)
+            );
+            assert_eq!(
+                status,
+                axum::http::StatusCode::CONFLICT,
+                "re-upload of {file}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let json: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|e| panic!("{file}: body is not JSON ({e})"));
+            assert_eq!(
+                json["code"],
+                crate::error::IMMUTABLE_RELEASE_CODE,
+                "{file}: {json}"
+            );
+        }
+    }
 }

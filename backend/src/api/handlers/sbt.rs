@@ -1269,6 +1269,46 @@ mod catalog_registration_tests {
             "only the client upload queues a push task; the replicated one must not"
         );
     }
+
+    /// #5: re-uploading a released Ivy asset with different bytes is refused
+    /// 409 with the stable `IMMUTABLE_RELEASE` code.
+    #[tokio::test]
+    async fn republish_of_a_released_asset_is_immutable_release_5() {
+        let Some(fx) = tdh::Fixture::setup("local", "sbt").await else {
+            return;
+        };
+        let uri = format!(
+            "/{}/com.example/frozen_2.13/1.0.0/jars/frozen_2.13-1.0.0.jar",
+            fx.repo_key
+        );
+        let first = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(uri.clone(), bytes::Bytes::from_static(b"first-jar-bytes")),
+        )
+        .await;
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(uri, bytes::Bytes::from_static(b"other-jar-bytes")),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert!(
+            first.0.is_success(),
+            "first upload: {} {}",
+            first.0,
+            String::from_utf8_lossy(&first.1)
+        );
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "re-upload: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE, "{json}");
+    }
 }
 
 /// #4100: scan-on-proxy on sbt's Ivy route, Remote and Virtual.
