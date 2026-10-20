@@ -1402,6 +1402,14 @@ impl MigrationWorker {
                 )
                 .await?;
             }
+            Err(e @ MigrationError::ReleaseImmutable(_)) => {
+                // #3: a conflict on a released coordinate is reported on the
+                // item, not as a job failure; the release keeps its bytes.
+                self.migration_service
+                    .skip_item(item_id, &e.to_string())
+                    .await?;
+                *skipped += 1;
+            }
             Err(e) => {
                 let err_msg = e.to_string();
 
@@ -1939,6 +1947,43 @@ impl MigrationWorker {
         }
 
         Ok(true)
+    }
+
+    /// Refuse to let the migration upsert replace a released row's bytes (#3).
+    ///
+    /// `Skip` re-processes an item whose declared digest differs from the
+    /// stored row, and `Overwrite`/`Rename` re-process every item, so without
+    /// this a run could rewrite a release in place or resurrect its tombstone
+    /// with different bytes. The refusal is [`MigrationError::ReleaseImmutable`],
+    /// which `process_single_artifact` reports as a conflict on the item.
+    async fn refuse_release_swap(
+        &self,
+        repository_id: Uuid,
+        path: &str,
+        sha256_hex: &str,
+    ) -> Result<(), MigrationError> {
+        if release_overwrite_override_granted() {
+            return Ok(());
+        }
+        let repo = crate::services::repository_service::RepositoryService::new(self.db.clone())
+            .get_by_id(repository_id)
+            .await
+            .map_err(|e| MigrationError::Other(e.to_string()))?;
+        match crate::services::artifact_service::refuse_released_byte_swap(
+            &self.db,
+            repository_id,
+            &repo,
+            path,
+            sha256_hex,
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(crate::error::AppError::Conflict(_)) => {
+                Err(MigrationError::ReleaseImmutable(path.to_string()))
+            }
+            Err(e) => Err(MigrationError::Other(e.to_string())),
+        }
     }
 
     /// #3533 F2: refuse to let a second, different manifest from the SAME job
@@ -2627,6 +2672,12 @@ impl MigrationWorker {
                         // conflict: a re-migration must not downgrade a row a
                         // native publish has since typed (e.g. a `.whl` stored
                         // as `application/zip`).
+                        //
+                        // #3: but never over a release with different bytes,
+                        // live or tombstoned. Identical bytes (a re-run's
+                        // no-op refresh) and unreleased rows proceed as before.
+                        self.refuse_release_swap(repository_id, &identity.path, &sha256_hex)
+                            .await?;
                         let id: Uuid = sqlx::query_scalar(
                             r#"
                             INSERT INTO artifacts (repository_id, path, name, version, size_bytes, checksum_sha256, checksum_sha1, storage_key, content_type, origin)
@@ -4558,6 +4609,14 @@ fn build_cache_skip_reason(err_msg: &str) -> String {
 /// string if no separator is present.
 pub(crate) fn extract_name_from_path(artifact_path: &str) -> &str {
     artifact_path.rsplit('/').next().unwrap_or(artifact_path)
+}
+
+/// Seam for the audited admin override (#10): whether a migration may replace
+/// the bytes of a released coordinate. No override exists yet, so a release is
+/// never replaced, whatever the job's `conflict_resolution`; #10 decides who
+/// may grant one and how it is audited.
+fn release_overwrite_override_granted() -> bool {
+    false
 }
 
 /// Decide whether a duplicate artifact row should be treated as already
