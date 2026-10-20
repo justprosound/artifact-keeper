@@ -149,6 +149,11 @@ impl MultiHasher {
 /// Mlmodel only) APPENDS an immutable revision to `artifact_versions` instead
 /// of conflicting, so both checks are relaxed for the HEAD row. Old revisions
 /// stay immutable and addressable.
+///
+/// #4812: a repository whose release immutability policy
+/// protects `path` treats it as a released coordinate whatever its version
+/// or classification, and versioning does not relax it. With the policy off
+/// (the default) both checks are exactly as described above.
 pub(crate) async fn enforce_path_immutability(
     db: &PgPool,
     repository_id: Uuid,
@@ -157,9 +162,14 @@ pub(crate) async fn enforce_path_immutability(
     version: Option<&str>,
     checksum_sha256: &str,
 ) -> Result<()> {
-    let versioning_active = repo
-        .map(|r| versioning_applies(&r.format, r.versioning_enabled))
-        .unwrap_or(false);
+    let protected = match repo {
+        Some(r) => crate::services::release_immutability::is_protected(db, r, path).await?,
+        None => false,
+    };
+    let versioning_active = !protected
+        && repo
+            .map(|r| versioning_applies(&r.format, r.versioning_enabled))
+            .unwrap_or(false);
 
     // (1) live-overwrite check
     let existing = sqlx::query!(
@@ -182,7 +192,7 @@ pub(crate) async fn enforce_path_immutability(
     // (2) release-immutability backstop
     match repo {
         Some(repo) => {
-            refuse_released_byte_swap(db, repository_id, repo, path, checksum_sha256).await
+            refuse_byte_swap(db, repository_id, repo, path, checksum_sha256, protected).await
         }
         None => Ok(()),
     }
@@ -196,7 +206,7 @@ pub(crate) async fn enforce_path_immutability(
 /// run check (1): the migration upsert re-imports identical bytes over a live
 /// release as a no-op repair, but must never swap a release's bytes (#3).
 /// Versioning repositories and genuine mutable index files are exempt, as in
-/// the full check.
+/// the full check, unless the release immutability policy protects the path.
 pub(crate) async fn refuse_released_byte_swap(
     db: &PgPool,
     repository_id: Uuid,
@@ -204,8 +214,23 @@ pub(crate) async fn refuse_released_byte_swap(
     path: &str,
     checksum_sha256: &str,
 ) -> Result<()> {
-    if versioning_applies(&repo.format, repo.versioning_enabled)
-        || crate::services::cache_classifier::is_explicitly_mutable_index(&repo.format, path)
+    let protected = crate::services::release_immutability::is_protected(db, repo, path).await?;
+    refuse_byte_swap(db, repository_id, repo, path, checksum_sha256, protected).await
+}
+
+/// [`refuse_released_byte_swap`] with the policy decision already made, so
+/// [`enforce_path_immutability`] reads the policy once for both checks.
+async fn refuse_byte_swap(
+    db: &PgPool,
+    repository_id: Uuid,
+    repo: &Repository,
+    path: &str,
+    checksum_sha256: &str,
+    protected: bool,
+) -> Result<()> {
+    if !protected
+        && (versioning_applies(&repo.format, repo.versioning_enabled)
+            || crate::services::cache_classifier::is_explicitly_mutable_index(&repo.format, path))
     {
         return Ok(());
     }
@@ -230,7 +255,8 @@ pub(crate) async fn refuse_released_byte_swap(
     // versioned artifact (version IS NOT NULL). A path-less, version-less
     // generic blob remains freely replaceable.
     if let Some((prior_sha256, prior_version)) = prior {
-        let is_released = prior_version.is_some()
+        let is_released = protected
+            || prior_version.is_some()
             || crate::services::cache_classifier::classify(&repo.format, path).is_immutable();
         if is_released && !prior_sha256.eq_ignore_ascii_case(checksum_sha256) {
             return Err(AppError::Immutable(

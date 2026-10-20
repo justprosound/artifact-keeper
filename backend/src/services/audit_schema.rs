@@ -296,6 +296,7 @@ mod tests {
                     allow_public_with_upstream_credentials: None,
                     upstream_auth_change: None,
                     age_gate_change: None,
+                    release_immutability_change: None,
                 }),
         ];
         for entry in &entries {
@@ -387,6 +388,13 @@ mod tests {
                     previous_mode: "first_seen".into(),
                     actor_tier: "repository_admin".into(),
                     relaxed: true,
+                }),
+                release_immutability_change: Some(details::ReleaseImmutabilityChangeAudit {
+                    previous_release_immutability: "on".into(),
+                    release_immutability: "on".into(),
+                    previous_immutability_exclusions: vec![],
+                    immutability_exclusions: vec!["nightly".into()],
+                    loosened: true,
                 }),
             })
             .unwrap(),

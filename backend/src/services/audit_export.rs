@@ -476,6 +476,24 @@ pub mod details {
         /// trail, not just the values it ended at.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub age_gate_change: Option<AgeGateChangeDetails>,
+        /// A release immutability policy change (#4812): the policy before
+        /// and after, and whether the change weakened protection.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub release_immutability_change: Option<ReleaseImmutabilityChangeAudit>,
+    }
+
+    /// Before/after of a repository's release immutability policy (#4812).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    pub struct ReleaseImmutabilityChangeAudit {
+        /// `off` or `on`.
+        pub previous_release_immutability: String,
+        /// `off` or `on`.
+        pub release_immutability: String,
+        pub previous_immutability_exclusions: Vec<String>,
+        pub immutability_exclusions: Vec<String>,
+        /// The change switched the policy off, or added an exclusion while
+        /// it is on.
+        pub loosened: bool,
     }
 
     /// Before/after of a repository's upstream URL, with userinfo stripped
@@ -1316,6 +1334,7 @@ mod tests {
             allow_public_with_upstream_credentials: None,
             upstream_auth_change: None,
             age_gate_change: None,
+            release_immutability_change: None,
         };
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["key"], "maven-releases");

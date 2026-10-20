@@ -197,6 +197,19 @@
             "actor_tier": { "type": "string", "enum": ["instance_admin", "repository_admin"] },
             "relaxed": { "type": "boolean" }
           }
+        },
+        "release_immutability_change": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["previous_release_immutability", "release_immutability", "previous_immutability_exclusions", "immutability_exclusions", "loosened"],
+          "description": "Present when a create or update set the release immutability policy (#4812): the policy before and after, and whether the change weakened protection (switched it off, or added an exclusion while it is on).",
+          "properties": {
+            "previous_release_immutability": { "type": "string", "enum": ["off", "on"] },
+            "release_immutability": { "type": "string", "enum": ["off", "on"] },
+            "previous_immutability_exclusions": { "type": "array", "items": { "type": "string" } },
+            "immutability_exclusions": { "type": "array", "items": { "type": "string" } },
+            "loosened": { "type": "boolean" }
+          }
         }
       }
     },

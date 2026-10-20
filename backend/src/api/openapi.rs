@@ -676,6 +676,38 @@ mod tests {
         }
     }
 
+    /// #4812: the release immutability policy is part of the published
+    /// repository contract, so generated clients can read and set it. It is
+    /// optional on create and update and always present on the response.
+    #[test]
+    fn test_repository_release_immutability_fields_in_spec() {
+        let spec = serde_json::to_value(build_openapi()).expect("serialize spec");
+        let schemas = &spec["components"]["schemas"];
+        assert_eq!(
+            schemas["ReleaseImmutability"]["enum"],
+            serde_json::json!(["off", "on"])
+        );
+        for (schema, required_on_schema) in [
+            ("CreateRepositoryRequest", false),
+            ("UpdateRepositoryRequest", false),
+            ("RepositoryResponse", true),
+        ] {
+            let props = &schemas[schema]["properties"];
+            let required: Vec<&str> = schemas[schema]["required"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            for field in ["release_immutability", "immutability_exclusions"] {
+                assert!(props[field].is_object(), "{schema}.{field} missing");
+                assert_eq!(
+                    required.contains(&field),
+                    required_on_schema,
+                    "{schema}.{field} required = {required:?}"
+                );
+            }
+        }
+    }
+
     /// #4330: `UpdateRepositoryRequest.curation_default_action` is an
     /// `Option<String>` (absent leaves the stored value unchanged), but a
     /// `value_type = String` override made the spec list it as required, so

@@ -44,6 +44,7 @@ use crate::services::cache_classifier;
 use crate::services::cache_classifier::{MAX_CACHE_TTL_SECS, MUTABLE_DEFAULT_TTL_SECS};
 use crate::services::conda_allowlist;
 use crate::services::quarantine_service;
+use crate::services::release_immutability::{self, ReleaseImmutability};
 use crate::services::repository_service::{
     derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, DisplayStorageUsage,
     MemberVisibility, RepoVisibility, RepositoryService,
@@ -979,6 +980,17 @@ pub struct CreateRepositoryRequest {
     /// uploads to Generic/Mlmodel repos append immutable revisions instead
     /// of overwriting. Defaults to false (current behavior preserved).
     pub versioning_enabled: Option<bool>,
+    /// Release immutability policy (#4812): `on` makes every file
+    /// path immutable once stored (no overwrite, no delete-then-reupload of
+    /// different bytes), except structurally mutable index files and paths
+    /// matching `immutability_exclusions`. Defaults to `off`, which keeps
+    /// only the always-on release rules. Local and staging repositories
+    /// only, and not together with `versioning_enabled`.
+    pub release_immutability: Option<ReleaseImmutability>,
+    /// `*` glob patterns exempt from the release immutability policy, each
+    /// matched against every `/`-separated path segment, case sensitively
+    /// (`nightly`, `latest`, `*-SNAPSHOT`). Defaults to none.
+    pub immutability_exclusions: Option<Vec<String>>,
     /// Override the default storage backend for this repository.
     /// When omitted, the server's configured default is used.
     /// Non-admin users may only use the default backend.
@@ -1247,6 +1259,15 @@ pub struct UpdateRepositoryRequest {
     /// When provided, enables/disables first-class artifact versioning for
     /// this Generic/Mlmodel repository (#2367). When omitted, unchanged.
     pub versioning_enabled: Option<bool>,
+    /// Switch the release immutability policy `on` or `off` (`upstream
+    /// #4812`). When omitted, unchanged. Switching it off, or adding an
+    /// exclusion while it is on, weakens protection and is recorded in the
+    /// audit log; like every update it requires the repository `admin`
+    /// action.
+    pub release_immutability: Option<ReleaseImmutability>,
+    /// Replace the exclusion patterns (`[]` clears them). When omitted,
+    /// unchanged.
+    pub immutability_exclusions: Option<Vec<String>>,
     /// Update the Cargo index upstream URL (stored in `repository_config`).
     /// When provided, upserts the `index_upstream_url` key for this repository.
     pub index_upstream_url: Option<String>,
@@ -1436,6 +1457,11 @@ pub struct RepositoryResponse {
     /// When true, uploads to this Generic/Mlmodel repository append immutable
     /// revisions instead of overwriting the prior content (#2367).
     pub versioning_enabled: bool,
+    /// Release immutability policy (#4812); `off` unless enabled.
+    pub release_immutability: ReleaseImmutability,
+    /// Patterns exempt from the release immutability policy; empty by
+    /// default.
+    pub immutability_exclusions: Vec<String>,
     /// Which storage backend holds this repository's content: `filesystem`,
     /// `s3`, `azure`, `gcs`. Accepted on create and immutable afterwards, so
     /// before #3917 it was write-only — no read path echoed it back and
@@ -1904,6 +1930,10 @@ fn repo_to_response(
         is_public: repo.is_public,
         promotion_only: repo.promotion_only,
         versioning_enabled: repo.versioning_enabled,
+        // db-less: not on the model; filled by `with_release_immutability`
+        // and by the listing's batch query.
+        release_immutability: ReleaseImmutability::Off,
+        immutability_exclusions: Vec::new(),
         storage_backend: repo.storage_backend,
         storage_used_bytes,
         member_storage_used_bytes: None,
@@ -2303,6 +2333,26 @@ async fn with_row_presence_fields(
         response.format_key = custom_format_key(&response.format, format_key);
     }
     response
+}
+
+/// Copy a release immutability policy (#4812) onto a response.
+fn apply_release_immutability(
+    response: &mut RepositoryResponse,
+    policy: release_immutability::ReleaseImmutabilityPolicy,
+) {
+    response.release_immutability = policy.release_immutability;
+    response.immutability_exclusions = policy.immutability_exclusions;
+}
+
+/// Populate the release immutability fields, which live on the repositories
+/// row but not on the model, for the handlers with a DB handle.
+async fn with_release_immutability(
+    db: &sqlx::PgPool,
+    mut response: RepositoryResponse,
+) -> Result<RepositoryResponse> {
+    let policy = release_immutability::load(db, response.id).await?;
+    apply_release_immutability(&mut response, policy);
+    Ok(response)
 }
 
 /// Returns `true` when `s` contains any line-ending character
@@ -3819,6 +3869,7 @@ pub async fn list_repositories(
     }
 
     let depth_settings = rpm_layout::settings(&state.db, &repo_ids).await?;
+    let mut immutability = release_immutability::load_many(&state.db, &repo_ids).await?;
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
         .map(|r| {
@@ -3833,6 +3884,9 @@ pub async fn list_repositories(
             if let Some(&(depth, editable)) = depth_settings.get(&resp.id) {
                 resp.repodata_depth = depth;
                 resp.repodata_depth_editable = editable;
+            }
+            if let Some(policy) = immutability.remove(&resp.id) {
+                apply_release_immutability(&mut resp, policy);
             }
             resp
         })
@@ -4097,6 +4151,19 @@ pub async fn create_repository(
         visibility.allows_anonymous_read(),
         state.guest_access_policy.is_enabled().await,
     )?;
+    // #4812: validated before the row exists, like the fields
+    // above, so a refused policy cannot leave a repository behind.
+    let immutability_policy = release_immutability::requested_policy(
+        &Default::default(),
+        payload.release_immutability,
+        payload.immutability_exclusions.as_deref(),
+        &repo_type,
+        crate::services::artifact_service::versioning_applies(
+            &format,
+            payload.versioning_enabled.unwrap_or(false),
+        ),
+    )?;
+
     // #4662: a public repository with upstream credentials spends them for
     // anonymous callers. Refused before the row exists unless accepted.
     let public_credentials_override = enforce_public_upstream_credentials(
@@ -4143,6 +4210,10 @@ pub async fn create_repository(
             provisioner,
         )
         .await?;
+
+    if let Some(ref policy) = immutability_policy {
+        release_immutability::store(&state.db, repo.id, policy).await?;
+    }
 
     // Provision the hex registry signing key (#2641). A hosted hex repository is
     // unusable by a real `mix` client until its registry resources are signed,
@@ -4372,6 +4443,9 @@ pub async fn create_repository(
                 allow_public_with_upstream_credentials: public_credentials_override.then_some(true),
                 upstream_auth_change: None,
                 age_gate_change: None,
+                release_immutability_change: immutability_policy
+                    .as_ref()
+                    .map(|p| release_immutability::change_audit(&Default::default(), p)),
             }),
     )
     .await;
@@ -4433,6 +4507,7 @@ pub async fn create_repository(
     // Reflect the trusted GPG key state (#2568) so the create response
     // round-trips with a subsequent GET. Only the boolean is exposed.
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
+    let response = with_release_immutability(&state.db, response).await?;
     let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
@@ -4499,6 +4574,7 @@ pub async fn get_repository(
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
     let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type, response).await?;
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
+    let response = with_release_immutability(&state.db, response).await?;
     let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
@@ -5138,6 +5214,22 @@ pub async fn update_repository(
         &existing.repo_type,
         payload.oci_trusted_bearer_realms.as_deref(),
     )?;
+    // #4812: validated before the update, merged onto the stored
+    // policy. Changing it needs nothing beyond the repository `admin` check
+    // above; a weakening is called out in the log and the audit entry.
+    let previous_immutability = release_immutability::load(&state.db, existing.id).await?;
+    let immutability_policy = release_immutability::requested_policy(
+        &previous_immutability,
+        payload.release_immutability,
+        payload.immutability_exclusions.as_deref(),
+        &existing.repo_type,
+        crate::services::artifact_service::versioning_applies(
+            &existing.format,
+            payload
+                .versioning_enabled
+                .unwrap_or(existing.versioning_enabled),
+        ),
+    )?;
     // #4467: an upstream URL change is applied. The service validates it like
     // create does and refuses (409) an origin change while upstream-auth
     // credentials are configured. Age-gate state still keyed by the old URL's
@@ -5180,6 +5272,19 @@ pub async fn update_repository(
             payload.repodata_depth,
         )
         .await?;
+
+    if let Some(ref policy) = immutability_policy {
+        release_immutability::store(&state.db, repo.id, policy).await?;
+        if previous_immutability.is_loosened_by(policy) {
+            tracing::warn!(
+                repository = %repo.key,
+                actor = %auth.username,
+                release_immutability = policy.release_immutability.as_str(),
+                immutability_exclusions = ?policy.immutability_exclusions,
+                "release immutability policy weakened (#4812)"
+            );
+        }
+    }
 
     // #2473: project-inherited grants on this repository just changed, so
     // drop cached resolutions now instead of serving the source project's
@@ -5516,6 +5621,9 @@ pub async fn update_repository(
                 allow_public_with_upstream_credentials: public_credentials_override.then_some(true),
                 upstream_auth_change: None,
                 age_gate_change: None,
+                release_immutability_change: immutability_policy
+                    .as_ref()
+                    .map(|p| release_immutability::change_audit(&previous_immutability, p)),
             }),
     )
     .await;
@@ -5550,6 +5658,7 @@ pub async fn update_repository(
         with_npm_scope_policy(&state.db, repo_id, &repo_type, &repo_format, response).await?;
     let response = with_oci_trusted_realms(&state.db, repo_id, &repo_type, response).await?;
     let response = with_row_presence_fields(&state.db, repo_id, response).await;
+    let response = with_release_immutability(&state.db, response).await?;
     let response = with_public_upstream_credentials(&state.db, response).await?;
     let response = with_repodata_depth(&state.db, response).await?;
     Ok(Json(response))
@@ -6239,6 +6348,7 @@ pub async fn delete_repository(
                 allow_public_with_upstream_credentials: None,
                 upstream_auth_change: None,
                 age_gate_change: None,
+                release_immutability_change: None,
             }),
     )
     .await;
@@ -12200,6 +12310,7 @@ async fn audit_upstream_auth_change(
                     credentials_changed,
                 )),
                 age_gate_change: None,
+                release_immutability_change: None,
             }),
     )
     .await;
@@ -13283,6 +13394,7 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
     ),
     components(schemas(
         crate::models::repository::RepositoryVisibility,
+        crate::services::release_immutability::ReleaseImmutability,
         ListRepositoriesQuery,
         CreateRepositoryRequest,
         UpdateRepositoryRequest,

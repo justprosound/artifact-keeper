@@ -2001,6 +2001,7 @@ fn scan_config_change_audit(
                 allow_public_with_upstream_credentials: None,
                 upstream_auth_change: None,
                 age_gate_change: None,
+                release_immutability_change: None,
             }),
     )
 }

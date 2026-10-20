@@ -520,6 +520,11 @@ mod gitlfs_download_auth_tests;
 #[cfg(test)]
 mod proxy_origin_policy_tests;
 
+/// #4812: the release immutability policy through the repository API.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod immutability_policy_api_tests;
+
 pub mod admin;
 pub mod admin_security;
 pub mod age_gate;
