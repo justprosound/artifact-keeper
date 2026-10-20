@@ -162,6 +162,27 @@ impl IncomingDigest<'_> {
     }
 }
 
+/// The `(checksum_sha256, version)` a previous publish left at `path`: the
+/// soft-deleted row, if one exists. Kept apart from the released/compare logic
+/// in [`purge_tombstone_checked`] so other sources of the prior record can
+/// slot in here.
+async fn prior_release_record(
+    db: &sqlx::PgPool,
+    repository_id: uuid::Uuid,
+    path: &str,
+) -> crate::error::Result<Option<(String, Option<String>)>> {
+    let prior = sqlx::query!(
+        "SELECT checksum_sha256, version FROM artifacts \
+             WHERE repository_id = $1 AND path = $2 AND is_deleted = true",
+        repository_id,
+        path
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| crate::error::AppError::Database(e.to_string()))?;
+    Ok(prior.map(|row| (row.checksum_sha256, row.version)))
+}
+
 /// [`cleanup_soft_deleted_artifact_checked`] for a handler that holds the
 /// incoming body as an [`IncomingDigest`] rather than a computed checksum. The
 /// digest is resolved only when a released tombstone sits at `path`.
@@ -179,25 +200,13 @@ pub async fn purge_tombstone_checked(
     // freely re-uploadable; everything else is a candidate release coordinate.
     if !cache_classifier::is_explicitly_mutable_index(format, path) {
         // Inspect the tombstone (if any) BEFORE it is purged.
-        let prior = sqlx::query!(
-            "SELECT checksum_sha256, version FROM artifacts \
-             WHERE repository_id = $1 AND path = $2 AND is_deleted = true",
-            repository_id,
-            path
-        )
-        .fetch_optional(db)
-        .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
-
-        if let Some(prior) = prior {
+        if let Some((prior_sha256, prior_version)) =
+            prior_release_record(db, repository_id, path).await?
+        {
             // Released = versioned coordinate or structurally immutable path.
             let is_released =
-                prior.version.is_some() || cache_classifier::classify(format, path).is_immutable();
-            if is_released
-                && !prior
-                    .checksum_sha256
-                    .eq_ignore_ascii_case(&incoming.resolve().await?)
-            {
+                prior_version.is_some() || cache_classifier::classify(format, path).is_immutable();
+            if is_released && !prior_sha256.eq_ignore_ascii_case(&incoming.resolve().await?) {
                 return Err(AppError::Immutable(
                     "Artifact version already exists and is immutable".to_string(),
                 ));
