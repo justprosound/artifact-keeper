@@ -144,7 +144,10 @@ mod tests {
     fn assert_validation(result: Result<RepositoryResponse>, needle: &str) {
         match result {
             Err(AppError::Validation(m)) => assert!(m.contains(needle), "{m}"),
-            other => panic!("expected a 400 naming {needle}, got {:?}", other.map(|r| r.key)),
+            other => panic!(
+                "expected a 400 naming {needle}, got {:?}",
+                other.map(|r| r.key)
+            ),
         }
     }
 
@@ -154,7 +157,10 @@ mod tests {
             return;
         };
         let plain = Rig::key("immut-default");
-        let created = rig.create(local(&plain, serde_json::json!({}))).await.unwrap();
+        let created = rig
+            .create(local(&plain, serde_json::json!({})))
+            .await
+            .unwrap();
         assert_policy(&created, ReleaseImmutability::Off, &[]);
         assert_policy(&rig.listed(&plain).await, ReleaseImmutability::Off, &[]);
 
@@ -170,8 +176,16 @@ mod tests {
             .await
             .unwrap();
         assert_policy(&created, ReleaseImmutability::On, &["latest", "nightly"]);
-        assert_policy(&rig.get(&key).await, ReleaseImmutability::On, &["latest", "nightly"]);
-        assert_policy(&rig.listed(&key).await, ReleaseImmutability::On, &["latest", "nightly"]);
+        assert_policy(
+            &rig.get(&key).await,
+            ReleaseImmutability::On,
+            &["latest", "nightly"],
+        );
+        assert_policy(
+            &rig.listed(&key).await,
+            ReleaseImmutability::On,
+            &["latest", "nightly"],
+        );
 
         let r = rig
             .update(&key, serde_json::json!({ "description": "unrelated" }))
@@ -186,8 +200,11 @@ mod tests {
         assert_policy(&r, ReleaseImmutability::On, &[]);
 
         assert_validation(
-            rig.update(&key, serde_json::json!({ "immutability_exclusions": ["a/b"] }))
-                .await,
+            rig.update(
+                &key,
+                serde_json::json!({ "immutability_exclusions": ["a/b"] }),
+            )
+            .await,
             "immutability_exclusions",
         );
         assert_policy(&rig.get(&key).await, ReleaseImmutability::On, &[]);
@@ -240,9 +257,12 @@ mod tests {
         assert_eq!(rig.row_count(&versioned).await, 0);
 
         let key = Rig::key("immut-then-versioning");
-        rig.create(local(&key, serde_json::json!({ "release_immutability": "on" })))
-            .await
-            .unwrap();
+        rig.create(local(
+            &key,
+            serde_json::json!({ "release_immutability": "on" }),
+        ))
+        .await
+        .unwrap();
         assert_validation(
             rig.update(&key, serde_json::json!({ "versioning_enabled": true }))
                 .await,
@@ -259,7 +279,10 @@ mod tests {
         };
         let key = Rig::key("immut-audit");
         let created = rig
-            .create(local(&key, serde_json::json!({ "release_immutability": "on" })))
+            .create(local(
+                &key,
+                serde_json::json!({ "release_immutability": "on" }),
+            ))
             .await
             .unwrap();
 
@@ -273,8 +296,15 @@ mod tests {
                 serde_json::json!({ "release_immutability": "off" }),
             )
             .await;
-        assert!(matches!(err, Err(AppError::Authorization(_))), "{:?}", err.map(|r| r.key));
-        assert!(release_immutability::load(&rig.pool, created.id).await.unwrap().is_on());
+        assert!(
+            matches!(err, Err(AppError::Authorization(_))),
+            "{:?}",
+            err.map(|r| r.key)
+        );
+        assert!(release_immutability::load(&rig.pool, created.id)
+            .await
+            .unwrap()
+            .is_on());
 
         rig.update(
             &key,
@@ -294,8 +324,14 @@ mod tests {
             })
         );
         let row = tdh::audit_row_eventually(&rig.pool, created.id, "REPOSITORY_CREATED").await;
-        assert_eq!(row.details["release_immutability_change"]["release_immutability"], "on");
-        assert_eq!(row.details["release_immutability_change"]["loosened"], false);
+        assert_eq!(
+            row.details["release_immutability_change"]["release_immutability"],
+            "on"
+        );
+        assert_eq!(
+            row.details["release_immutability_change"]["loosened"],
+            false
+        );
 
         tdh::cleanup_user(&rig.pool, writer_id).await;
         rig.done().await;
@@ -310,7 +346,10 @@ mod tests {
         };
         let member = Rig::key("immut-member");
         let member_repo = rig
-            .create(local(&member, serde_json::json!({ "release_immutability": "on" })))
+            .create(local(
+                &member,
+                serde_json::json!({ "release_immutability": "on" }),
+            ))
             .await
             .unwrap();
         let virt = Rig::key("immut-front");

@@ -43,8 +43,12 @@
 //!
 //! # Entry point for enforcement
 //!
-//! A write or delete path asks [`is_protected`] (or, holding a loaded policy,
-//! [`ReleaseImmutabilityPolicy::protects`]) and refuses a protected path.
+//! The upload oracle
+//! [`enforce_path_immutability`](crate::services::artifact_service::enforce_path_immutability)
+//! asks [`is_protected`] and refuses a protected path with
+//! [`AppError::Immutable`]. Other write, delete and lifecycle paths that
+//! touch stored bytes should ask the same question (or, holding a loaded
+//! policy, [`ReleaseImmutabilityPolicy::protects`]).
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -71,9 +75,7 @@ pub const MAX_EXCLUSIONS: usize = 64;
 pub const MAX_EXCLUSION_LEN: usize = 128;
 
 /// Whether a repository's release immutability policy is enforced.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ReleaseImmutability {
     /// Only the always-on release rules apply. The default.
@@ -129,7 +131,7 @@ impl ReleaseImmutabilityPolicy {
 
     /// The decision: whether `path` in a repository of `repo_type` and
     /// `format` is protected, so that different bytes must never replace
-    /// what is stored there and it must not be deleted without an override.
+    /// what is stored there.
     pub fn protects(
         &self,
         repo_type: &RepositoryType,
@@ -356,9 +358,8 @@ where
     Ok(())
 }
 
-/// Whether `path` in `repo` is protected by the repository's policy. The one
-/// call every write, delete and lifecycle path makes before touching stored
-/// bytes.
+/// Whether `path` in `repo` is protected by the repository's policy: the
+/// question a path that replaces stored bytes asks first.
 pub async fn is_protected<'e, E>(db: E, repo: &Repository, path: &str) -> Result<bool>
 where
     E: sqlx::PgExecutor<'e>,
@@ -401,7 +402,10 @@ mod tests {
     fn on_protects_every_generic_path() {
         let policy = on(&[]);
         for path in ["app/1.0/app.tgz", "blob.bin", "a/b/c/d.txt"] {
-            assert!(policy.protects(&LOCAL, &RepositoryFormat::Generic, path), "{path}");
+            assert!(
+                policy.protects(&LOCAL, &RepositoryFormat::Generic, path),
+                "{path}"
+            );
         }
     }
 
@@ -434,10 +438,20 @@ mod tests {
             "nightly/app.tgz",
             "app/nightly",
         ] {
-            assert!(!policy.protects(&LOCAL, &generic, path), "{path} is excluded");
+            assert!(
+                !policy.protects(&LOCAL, &generic, path),
+                "{path} is excluded"
+            );
         }
-        for path in ["app/1.0/app.tgz", "app/latest-1/app.tgz", "nightlyish/app.tgz"] {
-            assert!(policy.protects(&LOCAL, &generic, path), "{path} is protected");
+        for path in [
+            "app/1.0/app.tgz",
+            "app/latest-1/app.tgz",
+            "nightlyish/app.tgz",
+        ] {
+            assert!(
+                policy.protects(&LOCAL, &generic, path),
+                "{path} is protected"
+            );
         }
     }
 
@@ -567,7 +581,10 @@ mod tests {
                 serde_json::json!(mode.as_str())
             );
         }
-        assert_eq!(ReleaseImmutability::from_db_str("garbage"), ReleaseImmutability::On);
+        assert_eq!(
+            ReleaseImmutability::from_db_str("garbage"),
+            ReleaseImmutability::On
+        );
         assert!(serde_json::from_value::<ReleaseImmutability>(serde_json::json!("maybe")).is_err());
     }
 
@@ -579,8 +596,7 @@ mod tests {
             None
         );
         assert_eq!(
-            requested_policy(&current, Some(ReleaseImmutability::On), None, &LOCAL, false)
-                .unwrap(),
+            requested_policy(&current, Some(ReleaseImmutability::On), None, &LOCAL, false).unwrap(),
             None
         );
     }
@@ -589,8 +605,14 @@ mod tests {
     fn requested_policy_merges_onto_current() {
         let current = on(&["nightly"]);
         assert_eq!(
-            requested_policy(&current, Some(ReleaseImmutability::Off), None, &LOCAL, false)
-                .unwrap(),
+            requested_policy(
+                &current,
+                Some(ReleaseImmutability::Off),
+                None,
+                &LOCAL,
+                false
+            )
+            .unwrap(),
             Some(ReleaseImmutabilityPolicy {
                 release_immutability: ReleaseImmutability::Off,
                 immutability_exclusions: strings(&["nightly"]),
@@ -619,8 +641,9 @@ mod tests {
                 .unwrap(),
                 None
             );
-            let err = requested_policy(&off, Some(ReleaseImmutability::On), None, &repo_type, false)
-                .unwrap_err();
+            let err =
+                requested_policy(&off, Some(ReleaseImmutability::On), None, &repo_type, false)
+                    .unwrap_err();
             assert!(matches!(err, AppError::Validation(ref m) if m.contains("hosted member")));
             let list = strings(&["nightly"]);
             assert!(requested_policy(&off, None, Some(&list), &repo_type, false).is_err());
@@ -630,13 +653,16 @@ mod tests {
     #[test]
     fn requested_policy_refuses_versioning_combination() {
         let off = ReleaseImmutabilityPolicy::default();
-        let err = requested_policy(&off, Some(ReleaseImmutability::On), None, &LOCAL, true)
-            .unwrap_err();
+        let err =
+            requested_policy(&off, Some(ReleaseImmutability::On), None, &LOCAL, true).unwrap_err();
         assert!(matches!(err, AppError::Validation(ref m) if m.contains("versioning_enabled")));
         // Turning versioning on under an enforced policy is refused too.
         assert!(requested_policy(&on(&[]), None, None, &LOCAL, true).is_err());
         // Versioning with the policy off is today's behaviour.
-        assert_eq!(requested_policy(&off, None, None, &LOCAL, true).unwrap(), None);
+        assert_eq!(
+            requested_policy(&off, None, None, &LOCAL, true).unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -667,15 +693,19 @@ mod tests {
             .await
             .unwrap();
         assert!(is_protected(&pool, &repo, "app/1.0/app.tgz").await.unwrap());
-        assert!(!is_protected(&pool, &repo, "app/nightly/app.tgz").await.unwrap());
+        assert!(!is_protected(&pool, &repo, "app/nightly/app.tgz")
+            .await
+            .unwrap());
 
-        let rejected = sqlx::query(
-            "UPDATE repositories SET release_immutability = 'sometimes' WHERE id = $1",
-        )
-        .bind(repo_id)
-        .execute(&pool)
-        .await;
-        assert!(rejected.is_err(), "the CHECK constraint refuses unknown modes");
+        let rejected =
+            sqlx::query("UPDATE repositories SET release_immutability = 'sometimes' WHERE id = $1")
+                .bind(repo_id)
+                .execute(&pool)
+                .await;
+        assert!(
+            rejected.is_err(),
+            "the CHECK constraint refuses unknown modes"
+        );
 
         assert_eq!(
             load(&pool, Uuid::new_v4()).await.unwrap(),
@@ -720,7 +750,12 @@ mod tests {
             store(&self.pool, self.repo_id, policy).await.unwrap();
         }
 
-        async fn upload(&self, path: &str, version: Option<&str>, bytes: &'static [u8]) -> Result<Artifact> {
+        async fn upload(
+            &self,
+            path: &str,
+            version: Option<&str>,
+            bytes: &'static [u8],
+        ) -> Result<Artifact> {
             let name = path.rsplit('/').next().unwrap_or(path);
             self.svc
                 .upload_with_sync_options(
@@ -759,17 +794,16 @@ mod tests {
         }
     }
 
-    /// The refusal is asserted by HTTP status only, so this holds both for
-    /// today's `Conflict` and for the stable immutability error code.
+    /// Every policy refusal is the stable immutability error (#5): a 409
+    /// with `IMMUTABLE_RELEASE`, never a plain conflict.
     fn assert_refused(result: Result<Artifact>, what: &str) {
-        use axum::response::IntoResponse;
         match result {
-            Err(e) => assert_eq!(
-                e.into_response().status(),
-                axum::http::StatusCode::CONFLICT,
-                "{what}: the immutability refusal must be a 409"
+            Err(AppError::Immutable(_)) => {}
+            Err(e) => panic!("{what}: expected AppError::Immutable, got {e:?}"),
+            Ok(a) => panic!(
+                "{what}: expected a refusal, the upload of {} succeeded",
+                a.path
             ),
-            Ok(a) => panic!("{what}: expected a 409, the upload of {} succeeded", a.path),
         }
     }
 
@@ -830,12 +864,16 @@ mod tests {
 
         fx.set(&on(&[])).await;
         assert_refused(
-            fx.swap("com/x/app/1.1/app-1.1.unknownext", Some("1.1")).await,
+            fx.swap("com/x/app/1.1/app-1.1.unknownext", Some("1.1"))
+                .await,
             "maven release file, policy on",
         );
-        fx.swap("com/x/app/1.2-SNAPSHOT/app-1.2-SNAPSHOT.jar", Some("1.2-SNAPSHOT"))
-            .await
-            .expect("a -SNAPSHOT/ file stays replaceable with the policy on");
+        fx.swap(
+            "com/x/app/1.2-SNAPSHOT/app-1.2-SNAPSHOT.jar",
+            Some("1.2-SNAPSHOT"),
+        )
+        .await
+        .expect("a -SNAPSHOT/ file stays replaceable with the policy on");
         fx.done().await;
     }
 
@@ -864,13 +902,17 @@ mod tests {
             .execute(&fx.pool)
             .await
             .unwrap();
-        fx.upload("v/app.bin", Some("1"), b"original-bytes").await.unwrap();
+        fx.upload("v/app.bin", Some("1"), b"original-bytes")
+            .await
+            .unwrap();
         fx.upload("v/app.bin", Some("1"), b"DIFFERENT-bytes")
             .await
             .expect("policy off: versioning appends a revision");
 
         fx.set(&on(&[])).await;
-        fx.upload("w/app.bin", Some("1"), b"original-bytes").await.unwrap();
+        fx.upload("w/app.bin", Some("1"), b"original-bytes")
+            .await
+            .unwrap();
         assert_refused(
             fx.upload("w/app.bin", Some("1"), b"DIFFERENT-bytes").await,
             "versioning under policy on",

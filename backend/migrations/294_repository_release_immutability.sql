@@ -1,4 +1,4 @@
--- Migration 292: per-repository release immutability policy (#4812).
+-- Migration 294: per-repository release immutability policy (#4812).
 --
 --   repositories.release_immutability     -- 'off' (the default) keeps only
 --       the always-on release rules; 'on' makes every non-exempt file path
