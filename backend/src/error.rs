@@ -555,6 +555,8 @@ impl IntoResponse for AppError {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
@@ -893,7 +895,7 @@ mod tests {
     async fn test_immutable_renders_the_stable_code_in_the_body() {
         let resp = AppError::Immutable("Package already exists".into()).into_response();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(resp.into_body(), 65_536)
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
