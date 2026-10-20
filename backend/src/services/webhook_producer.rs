@@ -61,6 +61,9 @@ pub const BUS_TO_WEBHOOK_EVENT: &[(&str, &str)] = &[
     // subscribers that saw the approval/rejection never learn it was
     // reopened — the gap #2264's review-identity work rides along with.
     ("age_gate.reopened", "age_gate_reopened"),
+    // The release blocklist (upstream #4812).
+    ("release.blocked", "release_blocked"),
+    ("release.unblocked", "release_unblocked"),
 ];
 
 /// Map an EventBus event type (e.g. "artifact.created", "repository.deleted")
@@ -810,6 +813,8 @@ mod tests {
                 WebhookEvent::AgeGateApproved => ("age_gate.approved", "age_gate_approved"),
                 WebhookEvent::AgeGateRejected => ("age_gate.rejected", "age_gate_rejected"),
                 WebhookEvent::AgeGateReopened => ("age_gate.reopened", "age_gate_reopened"),
+                WebhookEvent::ReleaseBlocked => ("release.blocked", "release_blocked"),
+                WebhookEvent::ReleaseUnblocked => ("release.unblocked", "release_unblocked"),
             }
         }
 
@@ -830,6 +835,8 @@ mod tests {
             WebhookEvent::AgeGateQueued,
             WebhookEvent::AgeGateApproved,
             WebhookEvent::AgeGateRejected,
+            WebhookEvent::ReleaseBlocked,
+            WebhookEvent::ReleaseUnblocked,
         ];
 
         for variant in &all_variants {

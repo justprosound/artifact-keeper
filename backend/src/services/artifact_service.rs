@@ -2149,8 +2149,14 @@ impl ArtifactService {
     /// removed in #3499. There is deliberately no plugin veto on any delete
     /// path — do not reintroduce one without a design issue covering hook
     /// registration and request-path latency.
+    ///
+    /// A blocked release (upstream #4812) cannot be deleted, by anyone: that
+    /// would free its coordinate. Refused here so every delete that runs this
+    /// pre-flight is covered.
     pub async fn prepare_delete(&self, id: Uuid) -> Result<Artifact> {
-        self.get_by_id(id).await
+        let artifact = self.get_by_id(id).await?;
+        crate::services::release_block_service::refuse_delete_if_blocked(&self.db, id).await?;
+        Ok(artifact)
     }
 
     /// The delete's single durable state change, inside a caller-owned

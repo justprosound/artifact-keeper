@@ -276,6 +276,10 @@ pub enum WebhookEvent {
     /// that saw `age_gate_approved` / `age_gate_rejected` also see the
     /// decision being voided (#2264 rides this along).
     AgeGateReopened,
+    /// A release was blocked: no file of it can be downloaded (upstream #4812).
+    ReleaseBlocked,
+    /// A release block was lifted (upstream #4812).
+    ReleaseUnblocked,
 }
 
 impl WebhookEvent {
@@ -283,7 +287,7 @@ impl WebhookEvent {
     /// stores the [`Display`](std::fmt::Display) form of these (e.g.
     /// `artifact_uploaded`); the producer matches deliveries on exactly that
     /// string, so any other name can never fire (#4419).
-    pub const ALL: [WebhookEvent; 13] = [
+    pub const ALL: [WebhookEvent; 15] = [
         WebhookEvent::ArtifactUploaded,
         WebhookEvent::ArtifactDeleted,
         WebhookEvent::RepositoryCreated,
@@ -297,6 +301,8 @@ impl WebhookEvent {
         WebhookEvent::AgeGateApproved,
         WebhookEvent::AgeGateRejected,
         WebhookEvent::AgeGateReopened,
+        WebhookEvent::ReleaseBlocked,
+        WebhookEvent::ReleaseUnblocked,
     ];
 
     /// The subscribable event names, in [`WebhookEvent::ALL`] order.
@@ -351,6 +357,8 @@ impl std::fmt::Display for WebhookEvent {
             WebhookEvent::AgeGateApproved => write!(f, "age_gate_approved"),
             WebhookEvent::AgeGateRejected => write!(f, "age_gate_rejected"),
             WebhookEvent::AgeGateReopened => write!(f, "age_gate_reopened"),
+            WebhookEvent::ReleaseBlocked => write!(f, "release_blocked"),
+            WebhookEvent::ReleaseUnblocked => write!(f, "release_unblocked"),
         }
     }
 }
@@ -372,7 +380,8 @@ pub struct CreateWebhookRequest {
     /// `repository_deleted`, `user_created`, `user_deleted`,
     /// `build_started`, `build_completed`, `build_failed`,
     /// `age_gate_queued`, `age_gate_approved`, `age_gate_rejected`,
-    /// `age_gate_reopened`. Any other name is rejected with HTTP 400.
+    /// `age_gate_reopened`, `release_blocked`, `release_unblocked`. Any other
+    /// name is rejected with HTTP 400.
     pub events: Vec<String>,
     /// Optional caller-supplied secret. When omitted the server generates a
     /// fresh `whsec_*` secret. Either way the raw value is returned in the

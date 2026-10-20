@@ -235,6 +235,7 @@ mod tests {
             "AuthDetails",
             "ArtifactDetails",
             "SettingDetails",
+            "ReleaseBlockDetails",
         ] {
             assert!(s["$defs"][def].is_object(), "missing $def {def}");
         }
@@ -444,6 +445,47 @@ mod tests {
                 new_value: Some("1800".into()),
             })
             .unwrap(),
+        );
+        assert_valid_against(
+            "ReleaseBlockDetails",
+            &serde_json::to_value(details::ReleaseBlockDetails {
+                block_id: Uuid::new_v4(),
+                repository_key: "npm-releases".into(),
+                name: Some("left-pad".into()),
+                version: Some("1.3.0".into()),
+                path: Some("left-pad/-/left-pad-1.3.0.tgz".into()),
+                mode: "block".into(),
+                reason: "compromised maintainer token".into(),
+                actor_tier: "repository_admin".into(),
+                block_reason: Some("incident 42".into()),
+            })
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_release_block_envelope_validates_and_rejects_untyped_details() {
+        let entry = AuditEntry::new(AuditAction::ReleaseBlocked, ResourceType::Repository)
+            .details_typed(details::ReleaseBlockDetails {
+                block_id: Uuid::new_v4(),
+                repository_key: "pypi-releases".into(),
+                name: Some("requests".into()),
+                version: Some("2.0.0".into()),
+                path: None,
+                mode: "block".into(),
+                reason: "yanked upstream".into(),
+                actor_tier: "instance_admin".into(),
+                block_reason: None,
+            });
+        let record = serde_json::to_value(AuditEventRecord::from_entry(&entry)).unwrap();
+        assert_valid(&record);
+
+        let mut bad = record.clone();
+        bad["details"] = json!({ "reason": "no block id" });
+        let s = root();
+        assert!(
+            !validator::validate(&s, &bad, &s).is_empty(),
+            "RELEASE_BLOCKED details without block_id must not validate"
         );
     }
 

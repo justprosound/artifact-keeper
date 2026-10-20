@@ -107,6 +107,13 @@
         "properties": { "action": { "const": "SETTING_CHANGED" } }
       },
       "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/SettingDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
+    },
+    {
+      "if": {
+        "required": ["action"],
+        "properties": { "action": { "enum": ["RELEASE_BLOCKED", "RELEASE_UNBLOCKED"] } }
+      },
+      "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/ReleaseBlockDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
     }
   ],
   "$defs": {
@@ -293,6 +300,23 @@
         "key": { "type": "string" },
         "old_value": { "type": "string" },
         "new_value": { "type": "string" }
+      }
+    },
+    "ReleaseBlockDetails": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["block_id", "repository_key", "mode", "reason", "actor_tier"],
+      "description": "details for RELEASE_BLOCKED / RELEASE_UNBLOCKED. The coordinate is name + version for a version block, or path for a single-file block.",
+      "properties": {
+        "block_id": { "type": "string", "format": "uuid" },
+        "repository_key": { "type": "string" },
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "path": { "type": "string" },
+        "mode": { "type": "string", "examples": ["block"] },
+        "reason": { "type": "string" },
+        "actor_tier": { "type": "string", "examples": ["instance_admin", "repository_admin"] },
+        "block_reason": { "type": "string", "description": "On RELEASE_UNBLOCKED: the reason the lifted block was placed with." }
       }
     }
   }

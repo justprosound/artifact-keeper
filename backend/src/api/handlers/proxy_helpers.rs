@@ -5489,8 +5489,8 @@ impl LocalLookup<'_> {
 ///
 /// # The gate (#3220)
 ///
-/// This applies both halves of `quarantine_service::enforce_download_gate` —
-/// quarantine AND the repository's scan policy (`block_unscanned` /
+/// This applies every part of `quarantine_service::enforce_download_gate` —
+/// the release blocklist, quarantine AND the repository's scan policy (`block_unscanned` /
 /// `block_on_fail` / `max_severity`). Until #3220 it applied only
 /// [`check_quarantine_row`], the raw quarantine predicate. Since every
 /// `local_fetch_*` helper funnels through here, and those helpers are the
@@ -5539,6 +5539,10 @@ async fn local_lookup_artifact(
     Response,
 > {
     let artifact = lookup.fetch_row(db, repo_id).await?;
+    // The release blocklist (upstream #4812) first, as in `enforce_download_gate`.
+    crate::services::release_block_service::enforce_download_allowed(db, artifact.id)
+        .await
+        .map_err(|e| e.into_response())?;
     check_quarantine_row(&artifact)?;
     crate::services::quarantine_service::enforce_scan_policy_gate(db, artifact.id, repo_id)
         .await

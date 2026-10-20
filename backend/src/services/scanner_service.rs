@@ -11402,6 +11402,54 @@ mod tests {
         .expect("insert artifact");
     }
 
+    /// upstream #4812: a re-scan cannot unblock a blocked release. A clean scan
+    /// releases the file's timed quarantine hold, but the block is not stored in
+    /// `quarantine_status`, so the download gate still refuses it.
+    #[tokio::test]
+    async fn test_clean_rescan_does_not_lift_a_release_block() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::release_block_service as blocks;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+
+        let artifact_id = Uuid::new_v4();
+        let until = Utc::now() + chrono::Duration::hours(1);
+        insert_test_artifact(
+            &fx,
+            artifact_id,
+            "rescan-block",
+            Some("quarantined"),
+            Some(until),
+        )
+        .await;
+        blocks::block(
+            &fx.pool,
+            fx.repo_id,
+            &blocks::ReleaseCoordinate::Path("pkg.bin".into()),
+            "revoked",
+            fx.user_id,
+            &fx.username,
+        )
+        .await
+        .expect("block");
+
+        scanner_for_fixture(&fx)
+            .update_quarantine_status(artifact_id, 0)
+            .await
+            .expect("update_quarantine_status must not error");
+        let (status, _reason, _has_until) = quarantine_row(&fx.pool, artifact_id).await;
+        let gate =
+            crate::services::quarantine_service::enforce_download_gate(&fx.pool, artifact_id).await;
+        fx.teardown().await;
+
+        assert_eq!(status.as_deref(), Some("released"), "the scan did run");
+        assert!(
+            matches!(gate, Err(AppError::Authorization(ref m)) if m == blocks::BLOCKED_DOWNLOAD_MESSAGE),
+            "a clean re-scan must not lift the block: {gate:?}"
+        );
+    }
+
     /// The regression test for the headline bug (#2912): an enabled scan policy
     /// must actually quarantine at scan completion.
     ///

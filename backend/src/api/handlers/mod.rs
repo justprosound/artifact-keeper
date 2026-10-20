@@ -481,6 +481,7 @@ pub mod puppet;
 pub mod pypi;
 pub mod quality_gates;
 pub mod quarantine;
+pub mod release_blocks;
 pub mod remote_instances;
 pub mod repo_tokens;
 pub mod repositories;
