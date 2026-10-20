@@ -9446,6 +9446,252 @@ mod tests {
         assert_eq!(count, 1);
     }
 
+    // -----------------------------------------------------------------------
+    // #3: the migration write honours release immutability (DB-gated)
+    // -----------------------------------------------------------------------
+
+    const RELEASED_BYTES: &[u8] = b"pr3-released-bytes";
+
+    /// What one migrated item did to a pre-existing row at its path.
+    struct ReleaseRun {
+        /// `(completed, failed, skipped)` counters.
+        counts: (i32, i32, i32),
+        /// `(checksum_sha256, is_deleted)` of the row afterwards.
+        row: (String, bool),
+        /// `(status, error_message)` of the migration item.
+        item: (String, Option<String>),
+    }
+
+    /// Seed a row at `path` holding [`RELEASED_BYTES`] (`version`, live or a
+    /// tombstone), then migrate `incoming` to the same path in a real job
+    /// item under `conflict_resolution`. With `declare_sha256` the source
+    /// declares the incoming digest, so `Skip` sees a checksum mismatch and
+    /// re-processes the item instead of short-circuiting on the path.
+    async fn migrate_over_existing_row(
+        pool: &sqlx::PgPool,
+        prefix: &str,
+        version: Option<&str>,
+        is_deleted: bool,
+        incoming: &'static [u8],
+        conflict_resolution: ConflictResolution,
+        declare_sha256: bool,
+    ) -> ReleaseRun {
+        let (worker, storage, _tmp, repo_id, repo_key) =
+            setup_repo_for_import(pool, prefix, "generic").await;
+        let (_, conn_id, job_id) = seed_single_repo_job(pool, prefix).await;
+        let path = "pkg/1.0/file.txt";
+        let released = sha256_hex_of(RELEASED_BYTES);
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+             checksum_sha256, storage_key, content_type, is_deleted) \
+             VALUES ($1, $2, 'file.txt', $3, $4, $5, $6, 'application/octet-stream', $7)",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .bind(version)
+        .bind(RELEASED_BYTES.len() as i64)
+        .bind(&released)
+        .bind(ArtifactService::storage_key_from_checksum(&released))
+        .bind(is_deleted)
+        .execute(pool)
+        .await
+        .expect("seed existing row");
+        let item_id = worker
+            .add_migration_item(
+                job_id,
+                MigrationItemType::Artifact,
+                path,
+                incoming.len() as i64,
+                None,
+            )
+            .await
+            .expect("seed migration item");
+
+        let mut files = std::collections::HashMap::new();
+        files.insert(path.to_string(), bytes::Bytes::from_static(incoming));
+        let keys = RepoKeys {
+            source: repo_key.clone(),
+            target: repo_key.clone(),
+        };
+        let (mut completed, mut failed, mut skipped, mut transferred) = (0i32, 0i32, 0i32, 0i64);
+        worker
+            .process_single_artifact(
+                item_id,
+                Arc::new(MapSource { files }),
+                storage.clone(),
+                &keys,
+                "generic",
+                path,
+                path,
+                incoming.len() as i64,
+                ExpectedChecksums {
+                    sha256: declare_sha256.then(|| sha256_hex_of(incoming)),
+                    sha1: None,
+                },
+                conflict_resolution,
+                false,
+                &mut completed,
+                &mut failed,
+                &mut skipped,
+                &mut transferred,
+                None,
+            )
+            .await
+            .expect("process_single_artifact");
+
+        let row: (String, bool) = sqlx::query_as(
+            "SELECT checksum_sha256, is_deleted FROM artifacts \
+             WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_one(pool)
+        .await
+        .expect("read row");
+        let item: (String, Option<String>) =
+            sqlx::query_as("SELECT status, error_message FROM migration_items WHERE id = $1")
+                .bind(item_id)
+                .fetch_one(pool)
+                .await
+                .expect("read item");
+
+        let _ = sqlx::query("DELETE FROM artifacts WHERE repository_id = $1")
+            .bind(repo_id)
+            .execute(pool)
+            .await;
+        cleanup_repo(pool, repo_id).await;
+        cleanup_single_repo_job(pool, job_id, conn_id).await;
+        ReleaseRun {
+            counts: (completed, failed, skipped),
+            row,
+            item,
+        }
+    }
+
+    /// A refused item is reported as an immutability conflict: skipped (not
+    /// a job failure), with a reason that says so, and the release untouched.
+    fn assert_release_conflict(run: &ReleaseRun, is_deleted: bool) {
+        assert_eq!(
+            run.row,
+            (sha256_hex_of(RELEASED_BYTES), is_deleted),
+            "the released bytes must not change"
+        );
+        assert_eq!(run.counts, (0, 0, 1), "a conflict is skipped, not failed");
+        assert_eq!(run.item.0, "skipped");
+        assert!(
+            run.item.1.as_deref().unwrap_or_default().contains("immutable"),
+            "the item must say why it was refused; got {:?}",
+            run.item.1
+        );
+    }
+
+    /// #3: `Skip` with a declared, DIFFERENT sha256 re-processes the item
+    /// (`decide_duplicate_match`); the write must still refuse to replace
+    /// the live release.
+    #[tokio::test]
+    async fn test_migration_skip_different_bytes_over_live_release_is_conflict() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let run = migrate_over_existing_row(
+            &pool,
+            "mig3-skip-live",
+            Some("1.0.0"),
+            false,
+            b"pr3-other-bytes",
+            ConflictResolution::Skip,
+            true,
+        )
+        .await;
+        assert_release_conflict(&run, false);
+    }
+
+    /// #3: `Overwrite` must not replace a live release either (that needs
+    /// the admin override, #10).
+    #[tokio::test]
+    async fn test_migration_overwrite_different_bytes_over_live_release_is_conflict() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let run = migrate_over_existing_row(
+            &pool,
+            "mig3-ow-live",
+            Some("1.0.0"),
+            false,
+            b"pr3-other-bytes",
+            ConflictResolution::Overwrite,
+            false,
+        )
+        .await;
+        assert_release_conflict(&run, false);
+    }
+
+    /// #3: nor may it resurrect a released tombstone with different bytes.
+    #[tokio::test]
+    async fn test_migration_overwrite_different_bytes_over_release_tombstone_is_conflict() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let run = migrate_over_existing_row(
+            &pool,
+            "mig3-ow-tomb",
+            Some("1.0.0"),
+            true,
+            b"pr3-other-bytes",
+            ConflictResolution::Overwrite,
+            false,
+        )
+        .await;
+        assert_release_conflict(&run, true);
+    }
+
+    /// #3: re-migrating the SAME bytes over a release stays a no-op success.
+    #[tokio::test]
+    async fn test_migration_same_bytes_over_release_completes() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let run = migrate_over_existing_row(
+            &pool,
+            "mig3-same",
+            Some("1.0.0"),
+            false,
+            RELEASED_BYTES,
+            ConflictResolution::Overwrite,
+            false,
+        )
+        .await;
+        assert_eq!(run.counts, (1, 0, 0));
+        assert_eq!(run.row, (sha256_hex_of(RELEASED_BYTES), false));
+        assert_eq!(run.item.0, "completed");
+    }
+
+    /// #3: a version-less row is not a release, so `Overwrite` still
+    /// replaces it (behaviour unchanged).
+    #[tokio::test]
+    async fn test_migration_overwrite_replaces_unreleased_row() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let run = migrate_over_existing_row(
+            &pool,
+            "mig3-unrel",
+            None,
+            false,
+            b"pr3-other-bytes",
+            ConflictResolution::Overwrite,
+            false,
+        )
+        .await;
+        assert_eq!(run.counts, (1, 0, 0));
+        assert_eq!(run.row, (sha256_hex_of(b"pr3-other-bytes"), false));
+    }
+
     /// End-to-end #2457 import over the Artifactory source layout: a config
     /// blob, a layer blob, and a tagged image manifest must land in the OCI
     /// index (oci_blobs + oci_tags + manifest_blob_refs) with bytes at the
