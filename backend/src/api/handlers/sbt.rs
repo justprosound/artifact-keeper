@@ -1661,28 +1661,88 @@ mod release_tombstone_tests {
 
     const JAR_PATH: &str = "com.example/imm-lib/1.0.0/jars/imm-lib-1.0.0.jar";
 
-    async fn put_jar(fx: &tdh::Fixture, bytes: &'static [u8]) -> (StatusCode, bytes::Bytes) {
+    async fn put_at(
+        fx: &tdh::Fixture,
+        path: &str,
+        bytes: &'static [u8],
+    ) -> (StatusCode, bytes::Bytes) {
         tdh::send(
             fx.router_with_auth(super::router()),
             tdh::put(
-                format!("/{}/{JAR_PATH}", fx.repo_key),
+                format!("/{}/{path}", fx.repo_key),
                 bytes::Bytes::from_static(bytes),
             ),
         )
         .await
     }
 
-    /// Soft-delete the jar the way the artifact DELETE API does: the row stays
+    async fn put_jar(fx: &tdh::Fixture, bytes: &'static [u8]) -> (StatusCode, bytes::Bytes) {
+        put_at(fx, JAR_PATH, bytes).await
+    }
+
+    /// Soft-delete `path` the way the artifact DELETE API does: the row stays
     /// as a tombstone (`is_deleted = true`) carrying the released checksum.
-    async fn soft_delete_jar(fx: &tdh::Fixture) {
+    async fn soft_delete(fx: &tdh::Fixture, path: &str) {
         sqlx::query(
             "UPDATE artifacts SET is_deleted = true WHERE repository_id = $1 AND path = $2",
         )
         .bind(fx.repo_id)
-        .bind(JAR_PATH)
+        .bind(path)
         .execute(&fx.pool)
         .await
-        .expect("soft-delete jar");
+        .expect("soft-delete");
+    }
+
+    async fn soft_delete_jar(fx: &tdh::Fixture) {
+        soft_delete(fx, JAR_PATH).await
+    }
+
+    /// #25: an Ivy descriptor under a released revision is release metadata
+    /// (dependencies, configurations, publications), not a moving pointer, so
+    /// a deleted one refuses different bytes and takes back the identical
+    /// ones. Under a `-SNAPSHOT` revision it stays freely republishable.
+    #[tokio::test]
+    async fn sbt_ivy_descriptor_reupload_after_delete_25() {
+        let Some(fx) = tdh::Fixture::setup("local", "sbt").await else {
+            return;
+        };
+        for (path, released) in [
+            ("com.example/imm-lib/1.0.0/ivys/ivy.xml", true),
+            ("com.example/imm-lib/1.0.0/ivy-1.0.0.xml", true),
+            ("com.example/imm-lib/1.0.0/ivys/ivy.xml.sha1", true),
+            ("com.example/imm-lib/1.0.0-SNAPSHOT/ivys/ivy.xml", false),
+        ] {
+            let (status, _) = put_at(&fx, path, b"<ivy-module>original</ivy-module>").await;
+            assert!(
+                status.is_success(),
+                "{path}: first publish failed: {status}"
+            );
+            soft_delete(&fx, path).await;
+
+            let (status, body) = put_at(&fx, path, b"<ivy-module>swapped</ivy-module>").await;
+            if !released {
+                assert!(
+                    status.is_success(),
+                    "{path}: a snapshot descriptor must stay republishable: {status}"
+                );
+                continue;
+            }
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "{path}: different bytes under a deleted release must 409; body {:?}",
+                String::from_utf8_lossy(&body)
+            );
+            let json: serde_json::Value = serde_json::from_slice(&body).expect("structured 409");
+            assert_eq!(json["code"], "IMMUTABLE_RELEASE", "{path}");
+
+            let (status, _) = put_at(&fx, path, b"<ivy-module>original</ivy-module>").await;
+            assert!(
+                status.is_success(),
+                "{path}: the identical bytes must republish: {status}"
+            );
+        }
+        fx.teardown().await;
     }
 
     /// #2: sbt purged the tombstone unchecked, so delete + re-PUT swapped the
