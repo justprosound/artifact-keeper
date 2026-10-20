@@ -865,14 +865,16 @@ mod tests {
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
-        tdh::grant_repo_actions(&fx.pool, fx.repo_id, fx.user_id, &["read", "write", "delete"])
-            .await;
+        tdh::grant_repo_actions(
+            &fx.pool,
+            fx.repo_id,
+            fx.user_id,
+            &["read", "write", "delete"],
+        )
+        .await;
         let auth = Some(tdh::make_auth(fx.user_id, &fx.username));
         // {package}/{version}/{filename}: a versioned release coordinate.
-        let path = format!(
-            "app-{}/1.0.0/app-1.0.0.bin",
-            uuid::Uuid::new_v4().simple()
-        );
+        let path = format!("app-{}/1.0.0/app-1.0.0.bin", uuid::Uuid::new_v4().simple());
         let put = |bytes: &'static [u8]| {
             upload_artifact(
                 State(fx.state.clone()),
@@ -912,11 +914,17 @@ mod tests {
         fx.teardown().await;
 
         assert!(published.is_ok(), "initial publish: {published:?}");
-        assert!(deleted.is_ok(), "non-admin delete of the release: {deleted:?}");
+        assert!(
+            deleted.is_ok(),
+            "non-admin delete of the release: {deleted:?}"
+        );
         assert!(gc.is_ok(), "live GC pass: {gc:?}");
         // Positive control: GC really reclaimed the tombstone, so the 409
         // below cannot come from the soft-delete backstop.
-        assert_eq!(rows_after_gc, 0, "GC must hard-delete the released tombstone");
+        assert_eq!(
+            rows_after_gc, 0,
+            "GC must hard-delete the released tombstone"
+        );
         assert_eq!(
             swap.as_ref().err().map(|r| r.status()),
             Some(StatusCode::CONFLICT),

@@ -435,6 +435,13 @@ impl TrashService {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        // An administrator's permanent delete reopens the coordinate on
+        // purpose (#4700), so it also drops any record GC kept of it (#4812).
+        sqlx::query("DELETE FROM released_coordinates WHERE repository_id = $1 AND path = $2")
+            .bind(candidate.row.repository_id)
+            .bind(&candidate.row.path)
+            .execute(&mut *tx)
+            .await?;
         if let Err(e) = crate::services::package_service::prune_catalog_for_purged_artifact(
             &mut tx,
             candidate.row.repository_id,
@@ -765,6 +772,41 @@ pub(crate) mod tests {
         assert!(!row_left, "the trashed row is hard-deleted");
         assert!(!object_left, "an unshared object is deleted");
         assert!(matches!(again, Err(AppError::NotFound(_))), "{again:?}");
+    }
+
+    /// #4812: an administrator's permanent delete reopens the coordinate on
+    /// purpose (#4700), so it also drops the record storage GC keeps of a
+    /// reclaimed release at that path.
+    #[tokio::test]
+    async fn purge_drops_the_released_coordinate_record() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let path = format!("generic/burned-{}", Uuid::new_v4().simple());
+        let id = seed_trashed(&fx, &path, true).await;
+        sqlx::query(
+            "INSERT INTO released_coordinates (repository_id, path, checksum_sha256, version) \
+             VALUES ($1, $2, 'cafe', '1.0.0')",
+        )
+        .bind(fx.repo_id)
+        .bind(&path)
+        .execute(&fx.pool)
+        .await
+        .expect("seed released coordinate");
+
+        let purged = service(&fx, 30).purge(id).await;
+        let records: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM released_coordinates WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(&path)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("count records");
+        fx.teardown().await;
+
+        purged.expect("purge");
+        assert_eq!(records, 0, "the permanent delete must drop the GC record");
     }
 
     #[tokio::test]

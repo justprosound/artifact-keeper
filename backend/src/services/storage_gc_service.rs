@@ -915,6 +915,18 @@ impl CleanupSweepKind {
     }
 }
 
+/// Copy the coordinate and digest of every tombstone GC is about to reclaim
+/// for one storage key into `released_coordinates` (#4812). Scoped exactly
+/// like the hard-delete it precedes. The first reclaimed digest is kept.
+const RECORD_RECLAIMED_COORDINATES_SQL: &str = "INSERT INTO released_coordinates \
+     (repository_id, path, checksum_sha256, version) \
+     SELECT a.repository_id, a.path, a.checksum_sha256, a.version \
+     FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
+     WHERE a.storage_key = $1 AND a.is_deleted = true \
+       AND r.storage_backend = $2 \
+       AND (r.storage_backend <> 'filesystem' OR r.storage_path = $3) \
+     ON CONFLICT (repository_id, path) DO NOTHING";
+
 impl StorageGcService {
     pub fn new(db: PgPool, storage_registry: Arc<StorageRegistry>) -> Self {
         Self {
@@ -1432,6 +1444,23 @@ impl StorageGcService {
         {
             let _ = tx.rollback().await;
             let msg = format_gc_error("delete promotion_approvals", &storage_key, &e.to_string());
+            tracing::warn!("{}", msg);
+            result.errors.push(msg);
+            return;
+        }
+
+        // #4812: remember each reclaimed tombstone's coordinate and digest, so
+        // the release-immutability backstop still refuses different bytes at
+        // that path once the row below is gone. Same scope as the delete.
+        if let Err(e) = sqlx::query(RECORD_RECLAIMED_COORDINATES_SQL)
+            .bind(&storage_key)
+            .bind(&storage_backend)
+            .bind(&storage_path)
+            .execute(&mut *tx)
+            .await
+        {
+            let _ = tx.rollback().await;
+            let msg = format_gc_error("record released coordinates", &storage_key, &e.to_string());
             tracing::warn!("{}", msg);
             result.errors.push(msg);
             return;
