@@ -779,6 +779,25 @@ impl PromotionAudit<'_> {
     }
 }
 
+/// Refuse promoting bytes with `checksum_sha256` onto `path` in `target_repo`
+/// when that coordinate is a released tombstone holding different bytes (#1).
+/// Shared by the single, bulk and approval-execute paths.
+pub(crate) async fn target_release_accepts(
+    state: &SharedState,
+    target_repo: &crate::models::repository::Repository,
+    path: &str,
+    checksum_sha256: &str,
+) -> Result<()> {
+    super::ensure_release_tombstone_accepts(
+        &state.db,
+        &target_repo.format,
+        target_repo.id,
+        path,
+        checksum_sha256,
+    )
+    .await
+}
+
 /// The refusal a quality-gate block produces, as a [`PromotionResponse`]
 /// (shared by the single route's 409 audit row and the bulk item result).
 fn gate_block_refusal(
@@ -1289,6 +1308,27 @@ pub async fn promote_artifact(
     // approval, only a pending request, or a concurrent double-spend) returns 409
     // and the target is constrained to the approved pair. Done after the
     // gate/policy/rule checks so a rejected promotion never spends the approval.
+    // Release immutability (#1): different bytes may not land on a released
+    // coordinate of the target. Checked before the approval is spent and before
+    // any byte is copied, so a refusal leaves the tombstone, its stored bytes and
+    // the approval untouched.
+    if let Err(e) = target_release_accepts(
+        &state,
+        &target_repo,
+        &artifact.path,
+        &artifact.checksum_sha256,
+    )
+    .await
+    {
+        let refusal = failed_response(
+            build_promotion_source_display(&repo_key, &artifact.path),
+            build_promotion_target_display(&target_key, &artifact.path),
+            e.to_string(),
+        );
+        audit.record(artifact_id, &artifact.path, &refusal).await;
+        return Err(e);
+    }
+
     if approval_required {
         super::approval::require_and_consume_approval(
             &state.db,
@@ -1677,6 +1717,22 @@ pub async fn promote_artifacts_bulk(
                     continue;
                 }
             }
+        }
+
+        // Release immutability (#1): same check as the single path, per item.
+        if let Err(e) = target_release_accepts(
+            &state,
+            &target_repo,
+            &artifact.path,
+            &artifact.checksum_sha256,
+        )
+        .await
+        {
+            failed += 1;
+            let resp = failed_response(source_display, target_display, e.to_string());
+            audit.record(*artifact_id, &artifact.path, &resp).await;
+            results.push(resp);
+            continue;
         }
 
         // Approval gate (promotion-approval-gate-bypass): consume this item's

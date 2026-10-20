@@ -109,6 +109,24 @@ pub async fn cleanup_soft_deleted_artifact_checked(
     path: &str,
     new_checksum_sha256: &str,
 ) -> crate::error::Result<()> {
+    ensure_release_tombstone_accepts(db, format, repository_id, path, new_checksum_sha256).await?;
+    cleanup_soft_deleted_artifact(db, repository_id, path).await;
+    Ok(())
+}
+
+/// The release-immutability check of [`cleanup_soft_deleted_artifact_checked`]
+/// without the purge: refuse when `(repository_id, path)` holds a *released*
+/// tombstone whose bytes differ from `new_checksum_sha256`, and leave the
+/// tombstone in place either way. Paths that must refuse BEFORE they write any
+/// bytes or spend an approval (promotion, approval execute) check here first
+/// and purge later (#1).
+pub async fn ensure_release_tombstone_accepts(
+    db: &sqlx::PgPool,
+    format: &crate::models::repository::RepositoryFormat,
+    repository_id: uuid::Uuid,
+    path: &str,
+    new_checksum_sha256: &str,
+) -> crate::error::Result<()> {
     use crate::error::AppError;
     use crate::services::cache_classifier;
 
@@ -148,7 +166,6 @@ pub async fn cleanup_soft_deleted_artifact_checked(
         }
     }
 
-    cleanup_soft_deleted_artifact(db, repository_id, path).await;
     Ok(())
 }
 

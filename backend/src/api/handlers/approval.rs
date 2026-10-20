@@ -940,6 +940,34 @@ pub async fn approve_promotion(
     )
     .await?;
 
+    // Release immutability (#1): refuse before the copy and before the approval
+    // is marked approved, so a refusal leaves it pending for a reviewer.
+    if let Err(e) = super::promotion::target_release_accepts(
+        &state,
+        &target_repo,
+        &artifact.path,
+        &artifact.checksum_sha256,
+    )
+    .await
+    {
+        audit_fire_and_forget(
+            state.db.clone(),
+            AuditEntry::for_principal(AuditAction::PromotionRefused, ResourceType::Artifact, &auth)
+                .resource(artifact.id)
+                .resource_name(&artifact.path)
+                .details(serde_json::json!({
+                    "approval_id": approval_id,
+                    "artifact_id": artifact.id,
+                    "artifact_path": artifact.path,
+                    "source_repository": source_repo_key.0,
+                    "target_repository": target_repo_key.0,
+                    "message": e.to_string(),
+                })),
+        )
+        .await;
+        return Err(e);
+    }
+
     // Cross-repository write guard (#2511): the approval-execute copy re-uses the
     // SOURCE artifact's flat storage key when writing into the TARGET repo. On a
     // shared-namespace cloud backend that key may already be owned by a third
