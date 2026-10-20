@@ -235,6 +235,7 @@ mod tests {
             "AuthDetails",
             "ArtifactDetails",
             "SettingDetails",
+            "ImmutabilityOverrideDetails",
         ] {
             assert!(s["$defs"][def].is_object(), "missing $def {def}");
         }
@@ -442,6 +443,20 @@ mod tests {
                 key: "auth.session_ttl".into(),
                 old_value: Some("3600".into()),
                 new_value: Some("1800".into()),
+            })
+            .unwrap(),
+        );
+        assert_valid_against(
+            "ImmutabilityOverrideDetails",
+            &serde_json::to_value(details::ImmutabilityOverrideDetails {
+                repository_id: Uuid::new_v4(),
+                path: "com/x/app/1.0.0/app-1.0.0.jar".into(),
+                enforcement_point: crate::services::immutability_override::EnforcementPoint::Upload,
+                reason: "INC-42: rebuild of a corrupted publish".into(),
+                actor_tier: Some(
+                    crate::services::immutability_override::OverrideTier::RepositoryAdmin,
+                ),
+                refusal: "Artifact version already exists and is immutable".into(),
             })
             .unwrap(),
         );

@@ -2283,6 +2283,7 @@ async fn recipe_file_upload(
         repo.id,
         &artifact_path,
         &checksum_sha256,
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(|e| e.into_response())?;
@@ -3600,6 +3601,7 @@ async fn package_file_upload(
         repo.id,
         &artifact_path,
         &checksum_sha256,
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(|e| e.into_response())?;

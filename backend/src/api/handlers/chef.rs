@@ -505,6 +505,7 @@ async fn upload_cookbook(
         repo.id,
         &artifact_path,
         super::IncomingDigest::Staged(&staged),
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(IntoResponse::into_response)?;

@@ -1597,6 +1597,7 @@ async fn upload_zip(
         repo.id,
         &artifact_path,
         super::IncomingDigest::Bytes(&body),
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(IntoResponse::into_response)?;
@@ -1773,6 +1774,7 @@ async fn upload_mod(
         repo.id,
         &artifact_path,
         super::IncomingDigest::Bytes(&body),
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(IntoResponse::into_response)?;

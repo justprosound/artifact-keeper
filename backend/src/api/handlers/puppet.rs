@@ -400,6 +400,7 @@ async fn publish_module(
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
         "Module version already exists",
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await?;
 

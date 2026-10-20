@@ -1681,6 +1681,7 @@ async fn upload_module(
         repo.id,
         &artifact_path,
         super::IncomingDigest::Known(&checksum),
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(IntoResponse::into_response)?;
@@ -2439,6 +2440,7 @@ async fn upload_provider(
         repo.id,
         &artifact_path,
         super::IncomingDigest::Known(&checksum),
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(IntoResponse::into_response)?;

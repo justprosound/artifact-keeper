@@ -38,6 +38,13 @@ const X_MARKET_USER_ID: HeaderName = HeaderName::from_static("x-market-user-id")
 const VSCODE_SESSION_ID: HeaderName = HeaderName::from_static("vscode-sessionid");
 const X_MARKET_SEARCH_ACTIVITY_ID: HeaderName =
     HeaderName::from_static("x-market-search-activity-id");
+// The audited release-immutability override (#10), sent by the web UI.
+const IMMUTABILITY_OVERRIDE: HeaderName = HeaderName::from_static(
+    artifact_keeper_backend::services::immutability_override::OVERRIDE_HEADER,
+);
+const IMMUTABILITY_OVERRIDE_REASON: HeaderName = HeaderName::from_static(
+    artifact_keeper_backend::services::immutability_override::OVERRIDE_REASON_HEADER,
+);
 
 use artifact_keeper_backend::{
     api,
@@ -1250,6 +1257,8 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                         X_MARKET_USER_ID,
                         VSCODE_SESSION_ID,
                         X_MARKET_SEARCH_ACTIVITY_ID,
+                        IMMUTABILITY_OVERRIDE,
+                        IMMUTABILITY_OVERRIDE_REASON,
                     ])
                     .allow_credentials(true)
             } else {
@@ -1280,6 +1289,8 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
                             X_MARKET_USER_ID,
                             VSCODE_SESSION_ID,
                             X_MARKET_SEARCH_ACTIVITY_ID,
+                            IMMUTABILITY_OVERRIDE,
+                            IMMUTABILITY_OVERRIDE_REASON,
                         ])
                 }
             }

@@ -232,6 +232,14 @@ pub enum AuditAction {
     /// that every gate and the repository score read, including any `MAL-*`
     /// finding classed `malicious`.
     ExternalFindingsIngested,
+
+    // Release immutability override (#10). Appended at the END of the enum.
+    /// A system or repository admin overrode a release-immutability refusal
+    /// with a stated reason; the operation proceeded.
+    ImmutabilityOverridden,
+    /// A principal without that authority asked for the override; the
+    /// refusal stood.
+    ImmutabilityDenied,
 }
 
 impl AuditAction {
@@ -332,6 +340,8 @@ impl AuditAction {
             AuditAction::EnvironmentDeleted => "ENVIRONMENT_DELETED",
             AuditAction::LoginRateLimited => "LOGIN_RATE_LIMITED",
             AuditAction::ExternalFindingsIngested => "EXTERNAL_FINDINGS_INGESTED",
+            AuditAction::ImmutabilityOverridden => "IMMUTABILITY_OVERRIDDEN",
+            AuditAction::ImmutabilityDenied => "IMMUTABILITY_DENIED",
         }
     }
 }
@@ -1524,6 +1534,26 @@ mod tests {
             AuditAction::ExternalFindingsIngested.as_str(),
             "EXTERNAL_FINDINGS_INGESTED"
         );
+    }
+
+    #[test]
+    fn test_immutability_override_action_names_and_outcomes() {
+        // #10: SIEM rules key on these names; an honoured override is a
+        // success, a refused one a denial.
+        use crate::services::audit_export::Outcome;
+        assert_eq!(
+            AuditAction::ImmutabilityOverridden.as_str(),
+            "IMMUTABILITY_OVERRIDDEN"
+        );
+        assert_eq!(
+            AuditAction::ImmutabilityDenied.as_str(),
+            "IMMUTABILITY_DENIED"
+        );
+        assert_eq!(
+            AuditAction::ImmutabilityOverridden.outcome(),
+            Outcome::Success
+        );
+        assert_eq!(AuditAction::ImmutabilityDenied.outcome(), Outcome::Denied);
     }
 
     // -----------------------------------------------------------------------

@@ -604,6 +604,7 @@ async fn put_file(
             &artifact_path,
             super::IncomingDigest::Known(&checksum),
             "Module file already exists",
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
     };
     ensure_unique().await?;

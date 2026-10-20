@@ -1044,6 +1044,7 @@ async fn upload_chart(
         &artifact_path,
         super::IncomingDigest::Staged(&staged),
         &conflict_msg,
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await?;
 
@@ -1059,6 +1060,7 @@ async fn upload_chart(
             &prov_artifact_path,
             super::IncomingDigest::Staged(prov),
             &conflict_msg,
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await?;
     }

@@ -108,6 +108,7 @@ pub async fn cleanup_soft_deleted_artifact_checked(
     repository_id: uuid::Uuid,
     path: &str,
     new_checksum_sha256: &str,
+    ovr: &crate::services::immutability_override::ImmutabilityOverride,
 ) -> crate::error::Result<()> {
     purge_tombstone_checked(
         db,
@@ -115,6 +116,7 @@ pub async fn cleanup_soft_deleted_artifact_checked(
         repository_id,
         path,
         IncomingDigest::Known(new_checksum_sha256),
+        ovr,
     )
     .await
 }
@@ -125,19 +127,31 @@ pub async fn cleanup_soft_deleted_artifact_checked(
 /// tombstone in place either way. Paths that must refuse BEFORE they write any
 /// bytes or spend an approval (promotion, approval execute) check here first
 /// and purge later (#1).
+///
+/// `ovr` is the request's audited override (#10), decided at `point`. A
+/// caller that checks here and purges later passes the same value to both;
+/// a granted override then records one row per enforcement point.
 pub async fn ensure_release_tombstone_accepts(
     db: &sqlx::PgPool,
     format: &crate::models::repository::RepositoryFormat,
     repository_id: uuid::Uuid,
     path: &str,
     new_checksum_sha256: &str,
+    ovr: &crate::services::immutability_override::ImmutabilityOverride,
+    point: crate::services::immutability_override::EnforcementPoint,
 ) -> crate::error::Result<()> {
-    release_tombstone_accepts(
+    let verdict = release_tombstone_accepts(
         db,
         format,
         repository_id,
         path,
         &IncomingDigest::Known(new_checksum_sha256),
+    )
+    .await;
+    ovr.apply(
+        db,
+        crate::services::immutability_override::OverrideTarget::new(repository_id, path, point),
+        verdict,
     )
     .await
 }
@@ -248,14 +262,27 @@ async fn release_tombstone_accepts(
 /// [`cleanup_soft_deleted_artifact_checked`] for a handler that holds the
 /// incoming body as an [`IncomingDigest`] rather than a computed checksum. The
 /// digest is resolved only when a released prior record sits at `path`.
+///
+/// `ovr` is the request's audited override (#10): a granted one waives the
+/// refusal (recording `IMMUTABILITY_OVERRIDDEN`) and the purge proceeds; a
+/// refused request is recorded as `IMMUTABILITY_DENIED`. Pass
+/// [`ImmutabilityOverride::None`](crate::services::immutability_override::ImmutabilityOverride::None) where there is no request.
 pub async fn purge_tombstone_checked(
     db: &sqlx::PgPool,
     format: &crate::models::repository::RepositoryFormat,
     repository_id: uuid::Uuid,
     path: &str,
     incoming: IncomingDigest<'_>,
+    ovr: &crate::services::immutability_override::ImmutabilityOverride,
 ) -> crate::error::Result<()> {
-    release_tombstone_accepts(db, format, repository_id, path, &incoming).await?;
+    use crate::services::immutability_override::{EnforcementPoint, OverrideTarget};
+    let verdict = release_tombstone_accepts(db, format, repository_id, path, &incoming).await;
+    ovr.apply(
+        db,
+        OverrideTarget::new(repository_id, path, EnforcementPoint::TombstonePurge),
+        verdict,
+    )
+    .await?;
     cleanup_soft_deleted_artifact(db, repository_id, path).await;
     Ok(())
 }
@@ -1210,6 +1237,7 @@ mod tests {
             repo,
             path,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         assert!(
@@ -1226,6 +1254,79 @@ mod tests {
         assert_eq!(remaining, 1, "immutable tombstone must not be purged");
 
         cleanup_repo(&pool, repo).await;
+    }
+
+    /// #10: a granted override waives the swap refusal at the tombstone purge
+    /// and records it; a refused override request leaves the tombstone and
+    /// records the denial.
+    #[tokio::test]
+    async fn checked_cleanup_honours_and_audits_the_override_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::services::immutability_override::{
+            ImmutabilityOverride, OverrideActor, OverrideTier,
+        };
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "maven").await;
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let actor = OverrideActor { user_id, username };
+        let path = "com/x/app/1.0.0/app-1.0.0.jar";
+        insert_tombstone(&pool, repo, path, &"a".repeat(64)).await;
+        let purge = |ovr: ImmutabilityOverride| {
+            let pool = pool.clone();
+            async move {
+                purge_tombstone_checked(
+                    &pool,
+                    &RepositoryFormat::Maven,
+                    repo,
+                    path,
+                    IncomingDigest::Known(&"b".repeat(64)),
+                    &ovr,
+                )
+                .await
+            }
+        };
+        let rows = || {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
+                .bind(repo)
+                .fetch_one(&pool)
+        };
+
+        let denied = purge(ImmutabilityOverride::Denied {
+            actor: actor.clone(),
+            reason: "please".into(),
+        })
+        .await;
+        let rows_after_denied = rows().await.unwrap();
+        let denied_row = tdh::audit_row_eventually(&pool, repo, "IMMUTABILITY_DENIED").await;
+        let granted = purge(
+            ImmutabilityOverride::granted(actor, "INC-7 bad publish", OverrideTier::InstanceAdmin)
+                .unwrap(),
+        )
+        .await;
+        let rows_after_granted = rows().await.unwrap();
+        let granted_row = tdh::audit_row_eventually(&pool, repo, "IMMUTABILITY_OVERRIDDEN").await;
+        cleanup_repo(&pool, repo).await;
+        let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await;
+
+        assert!(
+            matches!(denied, Err(crate::error::AppError::Immutable(_))),
+            "{denied:?}"
+        );
+        assert_eq!(rows_after_denied, 1, "a refused override purges nothing");
+        assert_eq!(denied_row.details["enforcement_point"], "tombstone_purge");
+        assert!(granted.is_ok(), "{granted:?}");
+        assert_eq!(
+            rows_after_granted, 0,
+            "the granted override purges the tombstone"
+        );
+        assert_eq!(granted_row.user_id, Some(user_id));
+        assert_eq!(granted_row.details["reason"], "INC-7 bad publish");
+        assert_eq!(granted_row.details["actor_tier"], "instance_admin");
     }
 
     #[tokio::test]
@@ -1249,7 +1350,7 @@ mod tests {
             &RepositoryFormat::Maven,
             repo,
             path,
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // same sha, case-insensitive
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // same sha, case-insensitive, &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         assert!(res.is_ok(), "identical-bytes republish must be allowed");
@@ -1287,6 +1388,7 @@ mod tests {
             repo,
             path,
             &"b".repeat(64),
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await
         .unwrap();
@@ -1322,6 +1424,7 @@ mod tests {
             repo,
             path,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         assert!(
@@ -1362,6 +1465,7 @@ mod tests {
             repo,
             path,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         assert!(
@@ -1410,6 +1514,7 @@ mod tests {
             repo,
             path,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         let same = cleanup_soft_deleted_artifact_checked(
@@ -1418,6 +1523,7 @@ mod tests {
             repo,
             path,
             released,
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         cleanup_repo(&pool, repo).await;
@@ -1444,6 +1550,7 @@ mod tests {
             repo,
             path,
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         assert!(res.is_ok(), "first upload with no tombstone must proceed");
@@ -1501,6 +1608,7 @@ mod tests {
             repo,
             path,
             IncomingDigest::Bytes(b"abd"),
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         assert!(matches!(swapped, Err(crate::error::AppError::Immutable(_))));
@@ -1512,6 +1620,7 @@ mod tests {
             repo,
             path,
             IncomingDigest::Bytes(b"abc"),
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         assert!(same.is_ok(), "identical bytes purge the tombstone");
@@ -1537,6 +1646,7 @@ mod tests {
             repo,
             path,
             IncomingDigest::Staged(&other),
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         assert!(matches!(swapped, Err(crate::error::AppError::Immutable(_))));
@@ -1548,6 +1658,7 @@ mod tests {
             repo,
             path,
             IncomingDigest::Staged(&same),
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         assert!(res.is_ok(), "identical staged bytes purge the tombstone");
@@ -1574,6 +1685,7 @@ mod tests {
             repo,
             "pkg/2.0.0/pkg.bin",
             IncomingDigest::Staged(&staged),
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         assert!(fresh.is_ok(), "no tombstone: the digest is never needed");
@@ -1586,6 +1698,7 @@ mod tests {
             repo,
             path,
             IncomingDigest::Staged(&staged),
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         assert!(
@@ -1615,6 +1728,7 @@ mod tests {
             path,
             IncomingDigest::Bytes(b"abd"),
             "Chart demo version 1.0.0 already exists",
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await
         .expect_err("released tombstone must refuse different bytes");
@@ -1633,6 +1747,7 @@ mod tests {
             path,
             IncomingDigest::Bytes(b"abc"),
             "Chart demo version 1.0.0 already exists",
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await
         .unwrap_or_else(|_| panic!("identical bytes must pass"));
@@ -3492,7 +3607,7 @@ mod unchecked_purge_guard_tests {
             assert!(names_the_unchecked_purge(hit), "must flag: {hit}");
         }
         for miss in [
-            "    super::cleanup_soft_deleted_artifact_checked(&state.db, &f, id, &p, &s)",
+            "    super::cleanup_soft_deleted_artifact_checked(&state.db, &f, id, &p, &s, &crate::services::immutability_override::ImmutabilityOverride::None,)",
             "    // super::cleanup_soft_deleted_artifact(&state.db, repo.id, &path)",
             "    /// [`cleanup_soft_deleted_artifact`] deletes unconditionally.",
             "    my_cleanup_soft_deleted_artifact(db, id, &p).await;",

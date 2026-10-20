@@ -621,6 +621,7 @@ async fn push_pod(
         repo.id,
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(IntoResponse::into_response)?;

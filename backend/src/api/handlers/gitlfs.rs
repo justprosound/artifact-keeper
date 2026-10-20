@@ -582,6 +582,7 @@ async fn upload_object(
         repo.id,
         &artifact_path,
         super::IncomingDigest::Known(&oid),
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(IntoResponse::into_response)?;

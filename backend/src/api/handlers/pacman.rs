@@ -756,6 +756,7 @@ async fn store_package(
         &artifact_path,
         super::IncomingDigest::Bytes(&body),
         "Package already exists",
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await?;
 

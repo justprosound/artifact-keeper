@@ -1107,6 +1107,7 @@ async fn publish_release(
         repo.id,
         &artifact_path,
         super::IncomingDigest::Staged(&parts.staged),
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(swift_purge_refusal)?;

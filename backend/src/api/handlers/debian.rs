@@ -3929,6 +3929,7 @@ async fn persist_debian_upload(
         repo.id,
         &upload.artifact_path,
         super::IncomingDigest::Bytes(&body),
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(IntoResponse::into_response)?;

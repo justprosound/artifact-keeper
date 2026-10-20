@@ -799,6 +799,8 @@ pub(crate) async fn target_release_accepts(
         target_repo.id,
         path,
         checksum_sha256,
+        &crate::services::immutability_override::ImmutabilityOverride::None,
+        crate::services::immutability_override::EnforcementPoint::Promotion,
     )
     .await
 }

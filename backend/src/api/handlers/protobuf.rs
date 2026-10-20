@@ -774,6 +774,7 @@ async fn save_label_index(
                 repo_id,
                 &label_path,
                 crate::api::handlers::IncomingDigest::Known("none"),
+                &crate::services::immutability_override::ImmutabilityOverride::None,
             )
             .await
             .map_err(connect_purge_error)?;
@@ -1233,6 +1234,7 @@ async fn upload(
             repo.id,
             &artifact_path,
             super::IncomingDigest::Known(&commit_digest),
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await
         .map_err(connect_purge_error)?;

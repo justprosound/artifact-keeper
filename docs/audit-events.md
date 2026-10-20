@@ -124,6 +124,7 @@ the remaining actions is an incremental follow-up.
 | `LOGIN_FAILED`, `PERMISSION_DENIED`, `LOGIN_RATE_LIMITED` | `AuthDetails` (`username?`, `path?`, `method?`, `reason?`, federated labels?) |
 | `ARTIFACT_UPLOADED` / `_DOWNLOADED` / `_DELETED` | `ArtifactDetails` (`repository_id`, `path`, `name`, `version?`, `size_bytes?`, `digest?`, `uploaded_by?`) |
 | `SETTING_CHANGED` | `SettingDetails` (`key`, `old_value?`, `new_value?`) |
+| `IMMUTABILITY_OVERRIDDEN` / `IMMUTABILITY_DENIED` | `ImmutabilityOverrideDetails` (`repository_id`, `path`, `enforcement_point`, `reason`, `actor_tier?`, `refusal`) |
 
 ## Privileged administrative actions
 
@@ -163,6 +164,25 @@ A webhook `url` is recorded as scheme, host, port and path: userinfo, query
 string and fragment are dropped because receivers often carry a token there.
 `PROMOTION_REFUSED` and `PROMOTION_APPROVAL_DENIED` export with outcome
 `denied`; the others export as `success`.
+
+## Release immutability override
+
+A system admin, or a principal holding the repository `admin` action, can
+override a release-immutability refusal (`409 IMMUTABLE_RELEASE`) for one
+request by sending `X-Artifact-Keeper-Immutability-Override: true` and a reason
+in `X-Artifact-Keeper-Immutability-Override-Reason` (#10). Each decision about
+such a request writes one row. A request that does not send the header writes
+none, and neither does a request whose operation touches nothing released.
+
+| Action | Resource | Fires when | `details` |
+| --- | --- | --- | --- |
+| `IMMUTABILITY_OVERRIDDEN` | `repository` (`name` is the artifact path) | An immutability rule would have refused, and the caller had the authority. The operation proceeds only after this row is written; if the write fails the refusal stands. Outcome `success`. | `ImmutabilityOverrideDetails`: `repository_id`, `path`, `enforcement_point` (`upload`, `tombstone_purge`, `delete`, `trash_purge`, `migration`, `promotion`), the operator's `reason`, `actor_tier` (`instance_admin` or `repository_admin`), and the `refusal` that was waived. |
+| `IMMUTABILITY_DENIED` | `repository` | An immutability rule refused a caller who sent the override without the authority. The refusal stands. Outcome `denied`. | As `IMMUTABILITY_OVERRIDDEN`, without `actor_tier`. |
+
+A system admin's delete of a released artifact without the header is still
+allowed and records only `ARTIFACT_DELETED`, as before. With the header, the
+delete also records `IMMUTABILITY_OVERRIDDEN` and its reason. On
+`DELETE ...?permanent=true` the purge is a separate `trash_purge` decision.
 
 ## Conda channel and environment actions
 

@@ -353,6 +353,7 @@ async fn push_gem(
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
         "Gem version already exists",
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await?;
 

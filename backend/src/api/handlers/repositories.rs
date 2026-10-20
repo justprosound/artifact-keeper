@@ -43,6 +43,9 @@ use crate::services::audit_service::{
 use crate::services::cache_classifier;
 use crate::services::cache_classifier::{MAX_CACHE_TTL_SECS, MUTABLE_DEFAULT_TTL_SECS};
 use crate::services::conda_allowlist;
+use crate::services::immutability_override::{
+    EnforcementPoint, ImmutabilityOverride, OverrideTarget,
+};
 use crate::services::quarantine_service;
 use crate::services::repository_service::{
     derive_format_key, CreateRepositoryRequest as ServiceCreateRepoReq, DisplayStorageUsage,
@@ -9551,6 +9554,8 @@ pub async fn list_artifact_versions(
     params(
         ("key" = String, Path, description = "Repository key"),
         ("path" = String, Path, description = "Artifact path"),
+        ("x-artifact-keeper-immutability-override" = Option<String>, Header, description = "`true` to override release immutability (#10) and replace a released artifact: held by a system admin or the repository `admin` action, audited as `IMMUTABILITY_OVERRIDDEN`. A refused request is audited as `IMMUTABILITY_DENIED` and the 409 stands."),
+        ("x-artifact-keeper-immutability-override-reason" = Option<String>, Header, description = "Required with the override: why, at most 1024 bytes of visible ASCII. Recorded in the audit row."),
     ),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     security(("bearer_auth" = [])),
@@ -9559,7 +9564,7 @@ pub async fn list_artifact_versions(
         // (package-manager clients depend on it); the spec must say so or
         // strict generated SDKs treat every successful upload as an error.
         (status = 201, description = "Artifact uploaded", body = ArtifactResponse),
-        (status = 400, description = "Invalid artifact path, or the repository is virtual (direct uploads are not accepted)", body = crate::api::openapi::ErrorResponse),
+        (status = 400, description = "Invalid artifact path, the repository is virtual (direct uploads are not accepted), or the immutability override was requested without a valid reason", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Not authorized to write to this repository", body = crate::api::openapi::ErrorResponse),
         (status = 404, description = "Repository not found"),
@@ -9592,7 +9597,7 @@ pub async fn upload_artifact(
     upload_service::validate_artifact_path(&path)
         .map_err(|e| AppError::Validation(e.to_string()).into_response())?;
 
-    let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+    let (repo_service, repo, ovr) = authorize_generic_upload(&state, &auth, &key, &headers).await?;
 
     // Stream the request body into staging, computing SHA-256/SHA-1/MD5 in a
     // single pass — the whole artifact is never buffered in memory (#2517).
@@ -9625,6 +9630,7 @@ pub async fn upload_artifact(
         &headers,
         staged,
         digests,
+        ovr,
     )
     .await
 }
@@ -9788,11 +9794,22 @@ async fn stage_multipart_field(
 /// Authorize a generic artifact write: resolve the repository and enforce the
 /// write gates shared by the raw-`PUT` and multipart upload entry points, before
 /// any request body is consumed.
+///
+/// It also resolves the request's audited immutability override (#10) here, so
+/// a missing override reason is a 400 before the body is staged.
 async fn authorize_generic_upload(
     state: &SharedState,
     auth: &AuthExtension,
     key: &str,
-) -> std::result::Result<(RepositoryService, crate::models::repository::Repository), Response> {
+    headers: &HeaderMap,
+) -> std::result::Result<
+    (
+        RepositoryService,
+        crate::models::repository::Repository,
+        ImmutabilityOverride,
+    ),
+    Response,
+> {
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service
         .get_by_key(key)
@@ -9826,7 +9843,11 @@ async fn authorize_generic_upload(
         .into_response());
     }
 
-    Ok((repo_service, repo))
+    let ovr = ImmutabilityOverride::from_request(headers, auth, repo.id, &state.permission_service)
+        .await
+        .map_err(|e| e.into_response())?;
+
+    Ok((repo_service, repo, ovr))
 }
 
 /// Finish a generic artifact upload from an already-staged scratch file (#2517).
@@ -9878,6 +9899,7 @@ async fn persist_generic_staged_upload(
     headers: &HeaderMap,
     staged: GenericStagedBody,
     digests: crate::services::artifact_service::ContentDigests,
+    ovr: ImmutabilityOverride,
 ) -> std::result::Result<Response, Response> {
     // Verify declared checksums against the digests computed while staging —
     // same semantics as the old `verify_checksums(&body, ...)`, but with no
@@ -9934,7 +9956,8 @@ async fn persist_generic_staged_upload(
     let storage = state
         .storage_for_repo(&repo.storage_location())
         .map_err(|e| e.into_response())?;
-    let artifact_service = state.create_artifact_service(storage);
+    let mut artifact_service = state.create_artifact_service(storage);
+    artifact_service.set_immutability_override(ovr);
 
     // Extract name from path
     let name = path.split('/').next_back().unwrap_or(&path).to_string();
@@ -10163,7 +10186,7 @@ async fn upload_artifact_multipart_with_path(
     let auth = require_auth(auth).map_err(|e| e.into_response())?;
     auth.require_scope("write:artifacts")
         .map_err(|e| e.into_response())?;
-    let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+    let (repo_service, repo, ovr) = authorize_generic_upload(&state, &auth, &key, &headers).await?;
 
     // The URL path is the artifact path unless empty, when the uploaded file
     // name is; either is known by the time the file field streams (#3916).
@@ -10187,6 +10210,7 @@ async fn upload_artifact_multipart_with_path(
         &headers,
         staged,
         digests,
+        ovr,
     )
     .await
 }
@@ -10212,7 +10236,7 @@ async fn upload_artifact_multipart(
     let auth = require_auth(auth).map_err(|e| e.into_response())?;
     auth.require_scope("write:artifacts")
         .map_err(|e| e.into_response())?;
-    let (repo_service, repo) = authorize_generic_upload(&state, &auth, &key).await?;
+    let (repo_service, repo, ovr) = authorize_generic_upload(&state, &auth, &key, &headers).await?;
 
     // The artifact path may arrive in a `path` field after the file, so the
     // file stages before its path is known (#3916).
@@ -10233,6 +10257,7 @@ async fn upload_artifact_multipart(
         &headers,
         staged,
         digests,
+        ovr,
     )
     .await
 }
@@ -11357,7 +11382,8 @@ pub(crate) fn replication_exemption_trusted(
 #[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct DeleteArtifactQuery {
     /// Admin only: also purge the artifact from the trash, so its path can be
-    /// re-uploaded at once. Not available for OCI repositories.
+    /// re-uploaded at once. A repository admin may do so with the audited
+    /// immutability override (#10). Not available for OCI repositories.
     #[serde(default)]
     pub permanent: bool,
 }
@@ -11372,12 +11398,15 @@ pub struct DeleteArtifactQuery {
         ("key" = String, Path, description = "Repository key"),
         ("path" = String, Path, description = "Artifact path"),
         DeleteArtifactQuery,
+        ("x-artifact-keeper-immutability-override" = Option<String>, Header, description = "`true` to override release immutability (#10): held by a system admin or the repository `admin` action, audited as `IMMUTABILITY_OVERRIDDEN`. A refused request is audited as `IMMUTABILITY_DENIED` and the refusal stands."),
+        ("x-artifact-keeper-immutability-override-reason" = Option<String>, Header, description = "Required with the override: why, at most 1024 bytes of visible ASCII. Recorded in the audit row."),
     ),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Artifact deleted"),
+        (status = 400, description = "The immutability override was requested without a reason, or with one that is too long or not visible ASCII", body = crate::api::openapi::ErrorResponse),
         (status = 401, description = "Authentication required"),
-        (status = 403, description = "`permanent=true` requires an admin"),
+        (status = 403, description = "`permanent=true` requires an admin, or a repository admin sending the immutability override"),
         (status = 404, description = "Artifact not found"),
         (status = 409, description = "Artifact is immutable (released) and cannot be deleted (code `IMMUTABLE_RELEASE`), or `permanent=true` on an OCI repository (code `CONFLICT`)", body = crate::api::openapi::ErrorResponse),
     )
@@ -11391,9 +11420,6 @@ pub async fn delete_artifact(
 ) -> Result<()> {
     let auth = require_auth(auth)?;
     auth.require_scope("delete:artifacts")?;
-    if query.permanent {
-        auth.require_admin()?;
-    }
     let repo_service = RepositoryService::new(state.db.clone());
     let repo = repo_service.get_by_key(&key).await?;
     require_repo_write_access(&auth, &repo, &repo_service).await?;
@@ -11403,6 +11429,11 @@ pub async fn delete_artifact(
     // (deny-by-default) so a write-only grantee cannot destroy artifacts and a
     // rules-less/public repo confers no delete. Mirrors the upload `write` gate.
     require_repo_action(&auth, repo.id, "delete", &state.permission_service).await?;
+    // The audited override (#10), resolved once the caller is known to reach
+    // this repository; a missing reason is a 400 before anything changes.
+    let ovr =
+        ImmutabilityOverride::from_request(&headers, &auth, repo.id, &state.permission_service)
+            .await?;
     // Refused before the soft delete so a request never ends half done, and
     // after the access gates so it says nothing about a repository the caller
     // cannot write to.
@@ -11421,6 +11452,19 @@ pub async fn delete_artifact(
     // cache-invalidation all operate on one consistent, real artifact path.
     // No-op for non-npm formats and already-literal paths.
     let path = resolve_stored_path(&state, &repo, path).await?;
+
+    // `permanent=true` (`upstream #4701`) is the delete-side route past
+    // release immutability: the purge frees the path for different bytes. A
+    // system admin keeps it as before; anyone else needs the granted override,
+    // and an admin who sends the override has the purge recorded with it.
+    if query.permanent && (!auth.is_admin || ovr.is_granted()) {
+        ovr.on_refusal(
+            &state.db,
+            OverrideTarget::new(repo.id, &path, EnforcementPoint::TrashPurge),
+            AppError::Authorization("Admin access required".to_string()),
+        )
+        .await?;
+    }
 
     // Promotion-only release repositories: a direct DELETE is the symmetric
     // mutation to the (already-gated) direct upload and would let a principal
@@ -11456,10 +11500,16 @@ pub async fn delete_artifact(
     let is_replication = is_replication_request(&headers);
     let replication_trusted =
         replication_exemption_trusted(is_replication, auth.is_admin, auth.is_service_account);
-    if delete_blocked_by_immutability(&repo.format, &path, auth.is_admin, replication_trusted) {
-        return Err(AppError::Immutable(
-            "Cannot delete an immutable/released artifact".to_string(),
-        ));
+    // #10: the admin escape hatch stays implicit (unchanged behaviour); an
+    // admin who sends the override goes through it so the reason is recorded.
+    let admin_bypass = auth.is_admin && !ovr.is_granted();
+    if delete_blocked_by_immutability(&repo.format, &path, admin_bypass, replication_trusted) {
+        ovr.on_refusal(
+            &state.db,
+            OverrideTarget::new(repo.id, &path, EnforcementPoint::Delete),
+            AppError::Immutable("Cannot delete an immutable/released artifact".to_string()),
+        )
+        .await?;
     }
 
     let storage = state.storage_for_repo(&repo.storage_location())?;
@@ -18620,6 +18670,209 @@ mod tests {
             stored,
             Some(ArtifactService::calculate_sha256(b"REBUILT-RELEASE-BYTES"))
         );
+    }
+
+    /// #10 fixture: a repository with a plain member (read/write/delete) and a
+    /// principal holding the repository `admin` action.
+    struct OverrideFixture {
+        pool: sqlx::PgPool,
+        state: SharedState,
+        repo_id: Uuid,
+        key: String,
+        dir: std::path::PathBuf,
+        member: Uuid,
+        member_auth: Option<AuthExtension>,
+        owner: Uuid,
+        owner_auth: Option<AuthExtension>,
+    }
+
+    impl OverrideFixture {
+        async fn setup(format: &str) -> Option<Self> {
+            use crate::api::handlers::test_db_helpers as tdh;
+            let pool = tdh::try_pool().await?;
+            let (repo_id, key, dir) = tdh::create_repo(&pool, "local", format).await;
+            let (member, member_name) = tdh::create_user(&pool).await;
+            let (owner, owner_name) = tdh::create_user(&pool).await;
+            for user in [member, owner] {
+                tdh::grant_repo_access(&pool, repo_id, user).await;
+            }
+            tdh::grant_repo_actions(&pool, repo_id, member, &["read", "write", "delete"]).await;
+            tdh::grant_repo_admin(&pool, repo_id, owner).await;
+            let state = tdh::build_state(pool.clone(), dir.to_string_lossy().as_ref());
+            Some(Self {
+                member_auth: Some(tdh::make_auth(member, &member_name)),
+                owner_auth: Some(tdh::make_auth(owner, &owner_name)),
+                pool,
+                state,
+                repo_id,
+                key,
+                dir,
+                member,
+                owner,
+            })
+        }
+
+        async fn put(
+            &self,
+            auth: &Option<AuthExtension>,
+            path: &str,
+            headers: HeaderMap,
+            bytes: &'static [u8],
+        ) -> std::result::Result<Response, Response> {
+            upload_artifact(
+                State(self.state.clone()),
+                Extension(auth.clone()),
+                Path((self.key.clone(), path.to_string())),
+                headers,
+                Body::from(Bytes::from_static(bytes)),
+            )
+            .await
+        }
+
+        async fn delete(
+            &self,
+            auth: &Option<AuthExtension>,
+            path: &str,
+            headers: HeaderMap,
+            permanent: bool,
+        ) -> Result<()> {
+            delete_artifact(
+                State(self.state.clone()),
+                Extension(auth.clone()),
+                Path((self.key.clone(), path.to_string())),
+                Query(DeleteArtifactQuery { permanent }),
+                headers,
+            )
+            .await
+        }
+
+        /// How many `action` rows name `point` for this repository.
+        async fn audits(&self, action: &str, point: &str) -> i64 {
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM audit_log WHERE resource_id = $1 AND action = $2 \
+                 AND details->>'enforcement_point' = $3",
+            )
+            .bind(self.repo_id)
+            .bind(action)
+            .bind(point)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+        }
+
+        async fn teardown(self) {
+            use crate::api::handlers::test_db_helpers as tdh;
+            tdh::cleanup(&self.pool, self.repo_id, self.member).await;
+            tdh::cleanup(&self.pool, self.repo_id, self.owner).await;
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// #10 acceptance at the upload oracle: a non-admin sending the override is
+    /// refused (409 `IMMUTABLE_RELEASE`, `IMMUTABILITY_DENIED`); a repository
+    /// admin without a reason gets 400; with a reason the release is replaced
+    /// and `IMMUTABILITY_OVERRIDDEN` is recorded.
+    #[tokio::test]
+    async fn upload_override_acceptance_db() {
+        use crate::api::handlers::test_db_helpers::immutability_override_headers as ovr;
+        let Some(fx) = OverrideFixture::setup("generic").await else {
+            return;
+        };
+        let path = "app/1.0.0/app-1.0.0.bin";
+        let original = fx
+            .put(&fx.member_auth, path, HeaderMap::new(), b"ORIGINAL")
+            .await;
+        let denied = fx
+            .put(&fx.member_auth, path, ovr(Some("mine")), b"SWAPPED")
+            .await;
+        let no_reason = fx.put(&fx.owner_auth, path, ovr(None), b"SWAPPED").await;
+        let granted = fx
+            .put(
+                &fx.owner_auth,
+                path,
+                ovr(Some("INC-42 rebuild")),
+                b"REBUILT",
+            )
+            .await;
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT checksum_sha256 FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(path)
+        .fetch_optional(&fx.pool)
+        .await
+        .unwrap();
+        let denied_rows = fx.audits("IMMUTABILITY_DENIED", "upload").await;
+        let overridden_rows = fx.audits("IMMUTABILITY_OVERRIDDEN", "upload").await;
+        fx.teardown().await;
+
+        assert!(original.is_ok(), "initial publish: {original:?}");
+        let denied = denied.expect_err("a non-admin override must be refused");
+        assert_eq!(denied.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(denied.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("IMMUTABLE_RELEASE"),
+            "{body:?}"
+        );
+        assert_eq!(
+            no_reason.err().map(|r| r.status()),
+            Some(StatusCode::BAD_REQUEST)
+        );
+        assert!(granted.is_ok(), "repository admin override: {granted:?}");
+        assert_eq!(stored, Some(ArtifactService::calculate_sha256(b"REBUILT")));
+        assert_eq!(denied_rows, 1);
+        assert_eq!(overridden_rows, 1);
+    }
+
+    /// #10 acceptance at the REST delete guard, and `?permanent=true`
+    /// (`upstream #4701`) reached by a repository admin through the override.
+    #[tokio::test]
+    async fn delete_override_acceptance_db() {
+        use crate::api::handlers::test_db_helpers::immutability_override_headers as ovr;
+        let Some(fx) = OverrideFixture::setup("maven").await else {
+            return;
+        };
+        let path = "com/x/app/1.0.0/app-1.0.0.jar";
+        let original = fx
+            .put(&fx.member_auth, path, HeaderMap::new(), b"JAR")
+            .await;
+        let plain = fx
+            .delete(&fx.member_auth, path, HeaderMap::new(), false)
+            .await;
+        let denied = fx
+            .delete(&fx.member_auth, path, ovr(Some("mine")), false)
+            .await;
+        let no_reason = fx.delete(&fx.owner_auth, path, ovr(None), true).await;
+        let granted = fx
+            .delete(&fx.owner_auth, path, ovr(Some("INC-9 retract")), true)
+            .await;
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(fx.repo_id)
+        .bind(path)
+        .fetch_one(&fx.pool)
+        .await
+        .unwrap();
+        let denied_rows = fx.audits("IMMUTABILITY_DENIED", "delete").await;
+        let delete_rows = fx.audits("IMMUTABILITY_OVERRIDDEN", "delete").await;
+        let purge_rows = fx.audits("IMMUTABILITY_OVERRIDDEN", "trash_purge").await;
+        fx.teardown().await;
+
+        assert!(original.is_ok(), "initial publish: {original:?}");
+        assert!(matches!(plain, Err(AppError::Immutable(_))), "{plain:?}");
+        assert!(matches!(denied, Err(AppError::Immutable(_))), "{denied:?}");
+        assert!(
+            matches!(no_reason, Err(AppError::Validation(_))),
+            "{no_reason:?}"
+        );
+        assert!(granted.is_ok(), "repository admin override: {granted:?}");
+        assert_eq!(rows, 0, "deleted and purged from the trash");
+        assert_eq!(denied_rows, 1, "only the request that asked is audited");
+        assert_eq!(delete_rows, 1);
+        assert_eq!(purge_rows, 1);
     }
 
     /// PF-002 (#2519): the remote cached-artifact listing pages out of the

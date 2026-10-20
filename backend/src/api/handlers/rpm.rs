@@ -2519,6 +2519,7 @@ async fn store_rpm(
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
         "Package already exists",
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await?;
 

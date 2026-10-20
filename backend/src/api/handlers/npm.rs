@@ -5804,6 +5804,7 @@ async fn store_npm_version(
         repo_id,
         &artifact_path,
         &ver.sha256,
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(|e| e.into_response())?;

@@ -1151,6 +1151,7 @@ async fn upload_file_impl(
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
         "File already exists at this path",
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await?;
 

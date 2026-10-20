@@ -1768,6 +1768,7 @@ async fn store_crate_artifact(
         repo.id,
         &artifact_path,
         checksum,
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(|e| match e {

@@ -1782,6 +1782,7 @@ async fn upload_collection(
         &artifact_path,
         super::IncomingDigest::Staged(&staged),
         "Collection version already exists",
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await?;
 

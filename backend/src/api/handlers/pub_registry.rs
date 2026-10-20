@@ -731,6 +731,7 @@ async fn upload_package(
         repo.id,
         &artifact_path,
         super::IncomingDigest::Staged(&staged),
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await
     .map_err(pub_purge_refusal)?;

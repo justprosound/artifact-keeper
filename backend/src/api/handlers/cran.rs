@@ -370,6 +370,7 @@ async fn upload_package(
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
         "Package version already exists",
+        &crate::services::immutability_override::ImmutabilityOverride::None,
     )
     .await?;
 
