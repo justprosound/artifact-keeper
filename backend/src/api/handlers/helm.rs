@@ -3007,6 +3007,82 @@ wsDcBAEBCgAQBQJqWW7VCRA8wAoTVPCkgwAAVAoMACmQbvnhlkWncOkVJXfissGD\n\
         f.teardown().await;
     }
 
+    /// DELETE a released chart version through the ChartMuseum API.
+    async fn delete_chart_via_api(f: &tdh::Fixture, name: &str, version: &str) -> StatusCode {
+        let app = f.router_with_auth(super::router());
+        let req = axum::http::Request::builder()
+            .method("DELETE")
+            .uri(format!("/{}/api/charts/{}/{}", f.repo_key, name, version))
+            .body(Body::empty())
+            .unwrap();
+        tdh::send(app, req).await.0
+    }
+
+    fn immutable_chart_tgz(description: &str) -> Vec<u8> {
+        build_tgz(
+            "immchart/Chart.yaml",
+            format!("apiVersion: v2\nname: immchart\nversion: 1.0.0\ndescription: {description}\n")
+                .as_bytes(),
+        )
+    }
+
+    /// #2: deleting a released chart version must not reopen its coordinate
+    /// for different bytes. `ensure_unique_artifact_path` used to purge the
+    /// tombstone unchecked, so delete + re-push swapped the bytes behind
+    /// `immchart-1.0.0.tgz`.
+    #[tokio::test]
+    async fn test_helm_reupload_different_bytes_after_delete_is_immutable_2() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let original = immutable_chart_tgz("original");
+        let (status, _) = upload_parts(&f, &[("chart", "immchart-1.0.0.tgz", &original)]).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            delete_chart_via_api(&f, "immchart", "1.0.0").await,
+            StatusCode::OK
+        );
+
+        let swapped = immutable_chart_tgz("swapped");
+        let (status, body) = upload_parts(&f, &[("chart", "immchart-1.0.0.tgz", &swapped)]).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "re-pushing different bytes under a deleted release must 409; body {:?}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("structured 409");
+        assert_eq!(json["code"], "IMMUTABLE_RELEASE");
+
+        f.teardown().await;
+    }
+
+    /// #2: the identical bytes may still be re-pushed after a delete (undelete
+    /// / idempotent republish).
+    #[tokio::test]
+    async fn test_helm_reupload_identical_bytes_after_delete_is_allowed_2() {
+        let Some(f) = tdh::Fixture::setup("local", "helm").await else {
+            return;
+        };
+        let original = immutable_chart_tgz("original");
+        let (status, _) = upload_parts(&f, &[("chart", "immchart-1.0.0.tgz", &original)]).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            delete_chart_via_api(&f, "immchart", "1.0.0").await,
+            StatusCode::OK
+        );
+
+        let (status, body) = upload_parts(&f, &[("chart", "immchart-1.0.0.tgz", &original)]).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "re-pushing the identical bytes must succeed; body {:?}",
+            String::from_utf8_lossy(&body)
+        );
+
+        f.teardown().await;
+    }
+
     #[tokio::test]
     async fn test_helm_index_yaml_empty_repo() {
         let Some(f) = tdh::Fixture::setup("local", "helm").await else {
