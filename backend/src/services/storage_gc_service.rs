@@ -33,6 +33,9 @@ const OCI_CLEANUP_KEY_CLAIM_TTL_SQL: &str = "INTERVAL '15 minutes'";
 /// 3. It is not protected by an `oci_blobs` row (named blobs);
 /// 4. It is not the per-architecture child of a still-tagged OCI image index
 ///    (`oci_manifest_refs` joined against `oci_tags`; see migration 092).
+/// 5. No row holding the key, live or trashed, belongs to a blocked release
+///    (upstream #4812): its tombstones and bytes are kept for forensics, and
+///    the row delete below removes every trashed row sharing the key.
 ///
 /// The fragment expects two bindings: the outer `artifacts` row aliased
 /// `a` and the outer `repositories` row aliased `r`. Callers either inline
@@ -103,7 +106,22 @@ AND NOT EXISTS (
         OR omrr.storage_path = r.storage_path
       )
 )
+AND NOT EXISTS (
+    SELECT 1
+    FROM artifacts ab
+    JOIN release_blocks b ON b.repository_id = ab.repository_id
+     AND ((b.path IS NULL AND b.name = ab.name AND b.version = ab.version)
+          OR b.path = ab.path)
+    WHERE ab.storage_key = a.storage_key
+)
 "#;
+
+/// [`ORPHAN_PREDICATE_SQL`], for the release-blocklist test that pins its
+/// block-match clause to `release_block_service` (upstream #4812).
+#[cfg(test)]
+pub(crate) fn orphan_predicate_sql() -> &'static str {
+    ORPHAN_PREDICATE_SQL
+}
 
 /// Compile-time guard: the `'oci-manifests/'` literals embedded in
 /// [`ORPHAN_PREDICATE_SQL`] (both the `LIKE` filter and the `SUBSTRING`

@@ -12,8 +12,11 @@
 //!
 //! Blocking and unblocking are held by the repository's `admin` action or an
 //! instance admin, the same gate as the repository's other configuration
-//! (`require_repo_admin`). The reason is readable only through the
-//! authenticated `GET`; a refused download never carries it (upstream #2912).
+//! (`require_repo_admin`). A refused download never carries the reason
+//! (upstream #2912). The authenticated `GET` discloses it under the same rule
+//! as a quarantine reason (`GET /api/v1/quarantine/{id}`): only to a caller who
+//! holds the repository, not to one who can merely read it because it is
+//! public. Who placed the block goes only to the repository's admins.
 
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
@@ -25,7 +28,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::api::handlers::repositories::{
-    require_repo_admin, require_repo_write_access, require_visible,
+    require_repo_admin, require_repo_id_visible, require_repo_write_access,
 };
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
@@ -36,7 +39,7 @@ use crate::services::audit_service::{
     audit_fire_and_forget, AuditAction, AuditEntry, ResourceType,
 };
 use crate::services::release_block_service::{self as blocks, ReleaseBlock, ReleaseCoordinate};
-use crate::services::repository_service::RepositoryService;
+use crate::services::repository_service::{RepoAccess, RepositoryService};
 
 /// Mounted under `/api/v1/repositories`.
 pub fn repo_router() -> Router<SharedState> {
@@ -87,15 +90,39 @@ pub struct ReleaseBlockResponse {
     pub path: Option<String>,
     /// `block`.
     pub mode: String,
-    /// The reason the block was placed with.
-    pub reason: String,
-    /// Who placed the block; `None` once that account is deleted.
+    /// The reason the block was placed with. On `GET`, returned only to a
+    /// caller who holds the repository (an instance admin or a principal with
+    /// `read` on it), exactly as a quarantine reason is; `None` for a caller
+    /// who can see the repository only because it is public.
+    pub reason: Option<String>,
+    /// Who placed the block. Returned only to the repository's admins (and on
+    /// block / unblock, which only they can call); `None` otherwise, and once
+    /// that account is deleted.
     pub blocked_by: Option<Uuid>,
     pub blocked_by_username: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
-fn to_response(repository_key: &str, block: ReleaseBlock) -> ReleaseBlockResponse {
+/// What a [`ReleaseBlockResponse`] may disclose to its caller.
+#[derive(Debug, Clone, Copy)]
+struct Disclosure {
+    reason: bool,
+    actor: bool,
+}
+
+impl Disclosure {
+    /// Block and unblock: the caller is a repository admin.
+    const ADMIN: Self = Self {
+        reason: true,
+        actor: true,
+    };
+}
+
+fn to_response(
+    repository_key: &str,
+    block: ReleaseBlock,
+    disclose: Disclosure,
+) -> ReleaseBlockResponse {
     ReleaseBlockResponse {
         id: block.id,
         repository_key: repository_key.to_string(),
@@ -103,11 +130,40 @@ fn to_response(repository_key: &str, block: ReleaseBlock) -> ReleaseBlockRespons
         version: block.version,
         path: block.path,
         mode: block.mode,
-        reason: block.reason,
-        blocked_by: block.actor_id,
-        blocked_by_username: block.actor_name,
+        reason: disclose.reason.then_some(block.reason),
+        blocked_by: block.actor_id.filter(|_| disclose.actor),
+        blocked_by_username: block.actor_name.filter(|_| disclose.actor),
         created_at: block.created_at,
     }
+}
+
+/// What the `GET` discloses to `auth` about a block in `repository_id`.
+///
+/// The reason follows the quarantine reason gate (`get_quarantine_status`,
+/// #2912 / #3174): token scope covers the repository AND the caller is an
+/// instance admin or holds `read` on it. The `is_public` arm of visibility is
+/// deliberately not enough. The actor additionally needs the repository
+/// `admin` action.
+async fn disclosure_for(
+    state: &SharedState,
+    auth: &AuthExtension,
+    repository_id: Uuid,
+) -> Result<Disclosure> {
+    if !auth.can_access_repo(repository_id) {
+        return Ok(Disclosure {
+            reason: false,
+            actor: false,
+        });
+    }
+    let reason = auth.is_admin
+        || RepositoryService::new(state.db.clone())
+            .user_can_access_repo(repository_id, auth.user_id, RepoAccess::READ)
+            .await?;
+    let actor = reason
+        && require_repo_admin(auth, repository_id, &state.permission_service)
+            .await
+            .is_ok();
+    Ok(Disclosure { reason, actor })
 }
 
 fn actor_tier_label(auth: &AuthExtension) -> &'static str {
@@ -216,7 +272,10 @@ pub async fn block_release(
         None,
     )
     .await;
-    Ok((StatusCode::CREATED, Json(to_response(&repo.key, block))))
+    Ok((
+        StatusCode::CREATED,
+        Json(to_response(&repo.key, block, Disclosure::ADMIN)),
+    ))
 }
 
 /// Unblock a release
@@ -260,13 +319,16 @@ pub async fn unblock_release(
         Some(block.reason.clone()),
     )
     .await;
-    Ok(Json(to_response(&repo.key, block)))
+    Ok(Json(to_response(&repo.key, block, Disclosure::ADMIN)))
 }
 
 /// Read a release block
 ///
-/// The only place a block's reason is disclosed: authenticated, and only for a
-/// repository the caller can read. A refused download never carries it.
+/// The only place a block's reason is disclosed. Any authenticated caller who
+/// can see the repository learns whether the release is blocked; the reason
+/// goes only to a caller who holds the repository (as for a quarantine reason),
+/// and who placed the block only to its admins. A refused download carries
+/// neither.
 #[utoipa::path(
     get,
     path = "/{key}/releases/{coordinate}/block",
@@ -290,16 +352,26 @@ pub async fn get_release_block(
     Path((key, coordinate)): Path<(String, String)>,
     Query(query): Query<ReleaseBlockQuery>,
 ) -> Result<Json<ReleaseBlockResponse>> {
-    let caller = require_auth(auth.clone())?;
-    caller.require_scope("read:repositories")?;
-    let service = RepositoryService::new(state.db.clone());
-    let repo = service.get_by_key(&key).await?;
-    require_visible(&repo, &auth, &service).await?;
+    let auth = require_auth(auth)?;
+    auth.require_scope("read:repositories")?;
+    let repo = RepositoryService::new(state.db.clone())
+        .get_by_key(&key)
+        .await?;
+    // Existence gate, as `get_quarantine_status`: a repository the caller
+    // cannot see is the same 404 as one that does not exist.
+    require_repo_id_visible(
+        &state.db,
+        &auth,
+        repo.id,
+        crate::api::handlers::repositories::REPOSITORY_NOT_FOUND,
+    )
+    .await?;
     let coordinate = ReleaseCoordinate::parse(&coordinate, query.name.as_deref())?;
     let block = blocks::get(&state.db, repo.id, &coordinate)
         .await?
         .ok_or_else(|| AppError::NotFound("This release is not blocked".to_string()))?;
-    Ok(Json(to_response(&repo.key, block)))
+    let disclose = disclosure_for(&state, &auth, repo.id).await?;
+    Ok(Json(to_response(&repo.key, block, disclose)))
 }
 
 #[derive(OpenApi)]
@@ -457,22 +529,28 @@ mod tests {
 
     /// An anonymous download of a blocked release on a public repository is a
     /// 403 that does not carry the reason, and an anonymous caller cannot read
-    /// the block. An authenticated reader can.
+    /// the block. The `GET` follows the quarantine reason gate: an outsider who
+    /// sees the repository only because it is public learns that the release is
+    /// blocked but not why; a reader holding the repository gets the reason but
+    /// not who placed the block; a repository admin gets both.
     #[tokio::test]
-    async fn anonymous_caller_never_sees_the_block_reason_db() {
+    async fn block_reason_and_actor_follow_the_quarantine_disclosure_rule_db() {
         let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
             return;
         };
         tdh::publish_repo(&fx.pool, fx.repo_id).await;
         seed(&fx, "tool/9.9/tool.bin", "tool", "9.9").await;
+        let (admin_id, admin_name) = tdh::create_user(&fx.pool).await;
+        tdh::grant_repo_admin(&fx.pool, fx.repo_id, admin_id).await;
+        let (outsider_id, outsider_name) = tdh::create_user(&fx.pool).await;
         let secret = "incident INC-4812 internal note";
         crate::services::release_block_service::block(
             &fx.pool,
             fx.repo_id,
             &ReleaseCoordinate::Path("tool/9.9/tool.bin".into()),
             secret,
-            fx.user_id,
-            &fx.username,
+            admin_id,
+            &admin_name,
         )
         .await
         .expect("block");
@@ -481,10 +559,16 @@ mod tests {
         let (reader_status, reader_body) =
             download(&fx, Some(repo_admin(&fx)), "tool/9.9/tool.bin").await;
         let block_uri = format!("/{}/releases/tool%2F9.9%2Ftool.bin/block", fx.repo_key);
-        let (anon_read, _) = tdh::send(app(&fx, None), tdh::get(block_uri.clone())).await;
-        let (read_status, read_body) =
-            tdh::send(app(&fx, Some(repo_admin(&fx))), tdh::get(block_uri)).await;
+        let read =
+            |auth: Option<AuthExtension>| tdh::send(app(&fx, auth), tdh::get(block_uri.clone()));
+        let (anon_read, _) = read(None).await;
+        let (outsider_status, outsider_body) =
+            read(Some(tdh::make_auth(outsider_id, &outsider_name))).await;
+        let (member_status, member_body) = read(Some(repo_admin(&fx))).await;
+        let (admin_status, admin_body) = read(Some(tdh::make_auth(admin_id, &admin_name))).await;
+        tdh::cleanup_user(&fx.pool, outsider_id).await;
         fx.teardown().await;
+        tdh::cleanup_user(&fx.pool, admin_id).await;
 
         assert_eq!(anon_status, StatusCode::FORBIDDEN, "{anon_body}");
         assert!(!anon_body.contains("INC-4812"), "{anon_body}");
@@ -495,10 +579,35 @@ mod tests {
         assert_eq!(reader_status, StatusCode::FORBIDDEN);
         assert!(!reader_body.contains("INC-4812"), "{reader_body}");
         assert_eq!(anon_read, StatusCode::UNAUTHORIZED);
-        assert_eq!(read_status, StatusCode::OK);
-        let block: ReleaseBlockResponse = serde_json::from_slice(&read_body).unwrap();
-        assert_eq!(block.reason, secret);
-        assert_eq!(block.path.as_deref(), Some("tool/9.9/tool.bin"));
+
+        let parse = |status: StatusCode, body: &Bytes| -> ReleaseBlockResponse {
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(body));
+            serde_json::from_slice(body).unwrap()
+        };
+        let outsider = parse(outsider_status, &outsider_body);
+        assert_eq!(outsider.path.as_deref(), Some("tool/9.9/tool.bin"));
+        assert_eq!(
+            outsider.reason, None,
+            "public visibility alone must not disclose the reason"
+        );
+        assert_eq!(outsider.blocked_by, None);
+        assert_eq!(outsider.blocked_by_username, None);
+
+        let member = parse(member_status, &member_body);
+        assert_eq!(member.reason.as_deref(), Some(secret));
+        assert_eq!(
+            member.blocked_by, None,
+            "the actor is for repository admins only"
+        );
+        assert_eq!(member.blocked_by_username, None);
+
+        let admin = parse(admin_status, &admin_body);
+        assert_eq!(admin.reason.as_deref(), Some(secret));
+        assert_eq!(admin.blocked_by, Some(admin_id));
+        assert_eq!(
+            admin.blocked_by_username.as_deref(),
+            Some(admin_name.as_str())
+        );
     }
 
     /// Blocking is repository administration: a member with write access is

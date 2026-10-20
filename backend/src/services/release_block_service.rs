@@ -40,8 +40,9 @@ pub const MODE_BLOCK: &str = "block";
 
 /// The SQL condition matching a `release_blocks b` row to an `artifacts a`
 /// row: the same repository and either the same `(name, version)` or, for a
-/// path block, the same path.
-const BLOCK_MATCHES_ARTIFACT_SQL: &str = "b.repository_id = a.repository_id \
+/// path block, the same path. Storage GC embeds it literally in its orphan
+/// predicate; a test there pins the two together.
+pub(crate) const BLOCK_MATCHES_ARTIFACT_SQL: &str = "b.repository_id = a.repository_id \
      AND ((b.path IS NULL AND b.name = a.name AND b.version = a.version) \
           OR b.path = a.path)";
 
@@ -161,6 +162,29 @@ pub async fn is_artifact_blocked(db: &PgPool, artifact_id: Uuid) -> Result<bool>
 /// when `artifact_id` belongs to a blocked release.
 pub async fn enforce_download_allowed(db: &PgPool, artifact_id: Uuid) -> Result<()> {
     download_gate_result(is_artifact_blocked(db, artifact_id).await?)
+}
+
+/// `AND`-able SQL: the `artifacts a` row is not part of a blocked release.
+/// For hard deletes of tombstones that must leave a blocked release's rows
+/// in place.
+pub(crate) fn artifact_not_blocked_sql() -> String {
+    format!("NOT EXISTS (SELECT 1 FROM release_blocks b WHERE {BLOCK_MATCHES_ARTIFACT_SQL})")
+}
+
+/// Whether the trashed row at `(repository_id, path)` belongs to a blocked
+/// release. Purging it to make room for a re-publish would free the blocked
+/// coordinate.
+pub async fn tombstone_is_blocked(db: &PgPool, repository_id: Uuid, path: &str) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM artifacts a JOIN release_blocks b ON {BLOCK_MATCHES_ARTIFACT_SQL} \
+         WHERE a.repository_id = $1 AND a.path = $2 AND a.is_deleted = true)"
+    );
+    sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(&*sql))
+        .bind(repository_id)
+        .bind(path)
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))
 }
 
 /// Refuse to delete (or purge) `artifact_id` while its release is blocked.
@@ -609,5 +633,149 @@ mod tests {
         );
         assert!(matches!(delete, Err(AppError::Immutable(_))), "{delete:?}");
         assert!(live, "the refused delete left the restored row live");
+    }
+
+    /// Storage GC's orphan predicate embeds the block-match condition
+    /// literally (it is a `const` SQL string); it must stay the same condition
+    /// as [`BLOCK_MATCHES_ARTIFACT_SQL`], with its artifact alias `ab`.
+    #[test]
+    fn storage_gc_orphan_predicate_embeds_the_block_match() {
+        let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let expected = squash(&BLOCK_MATCHES_ARTIFACT_SQL.replace("a.", "ab."));
+        let gc = squash(crate::services::storage_gc_service::orphan_predicate_sql());
+        assert!(gc.contains(&expected), "{expected}\n---\n{gc}");
+    }
+
+    /// Seed a stored, trashed file of `name`/`version` and return its id.
+    async fn seed_trashed(fx: &tdh::Fixture, path: &str, name: &str, version: &str) -> Uuid {
+        let repo = fx.repo_info("local", None);
+        let id = tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &repo,
+            &format!("rb-gc/{}.bin", Uuid::new_v4()),
+            path,
+            name,
+            version,
+            "application/octet-stream",
+            bytes::Bytes::from(format!("bytes of {path}")),
+            fx.user_id,
+        )
+        .await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(id)
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn row_exists(fx: &tdh::Fixture, id: Uuid) -> bool {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM artifacts WHERE id = $1)")
+            .bind(id)
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Storage GC reaps an ordinary trashed row but keeps a blocked release's
+    /// trashed row (and so its bytes).
+    #[tokio::test]
+    async fn storage_gc_keeps_a_blocked_release_tombstone_db() {
+        let _guard = crate::services::storage_gc_service::storage_gc_test_guard().await;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let blocked = seed_trashed(&fx, "keep/1.0/keep.bin", "keep", "1.0").await;
+        let control = seed_trashed(&fx, "reap/1.0/reap.bin", "reap", "1.0").await;
+        block(
+            &fx.pool,
+            fx.repo_id,
+            &version("keep", "1.0"),
+            "forensics",
+            fx.user_id,
+            &fx.username,
+        )
+        .await
+        .expect("block");
+
+        let gc = crate::services::storage_gc_service::StorageGcService::new(
+            fx.pool.clone(),
+            fx.state.storage_registry.clone(),
+        )
+        .run_gc_for_repository(fx.repo_id, false)
+        .await;
+        let blocked_kept = row_exists(&fx, blocked).await;
+        let control_kept = row_exists(&fx, control).await;
+        fx.teardown().await;
+
+        gc.expect("gc");
+        assert!(
+            !control_kept,
+            "the unblocked tombstone is reaped, so GC ran"
+        );
+        assert!(
+            blocked_kept,
+            "a blocked release's tombstone must survive GC"
+        );
+    }
+
+    /// The tombstone purge that format handlers run before re-inserting at a
+    /// path never removes a blocked release's row; the checked variant refuses
+    /// the re-publish with IMMUTABLE_RELEASE even for identical bytes.
+    #[tokio::test]
+    async fn tombstone_cleanup_keeps_a_blocked_release_row_db() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let blocked = seed_trashed(&fx, "keep/2.0/keep.bin", "keep", "2.0").await;
+        let control = seed_trashed(&fx, "free/2.0/free.bin", "free", "2.0").await;
+        block(
+            &fx.pool,
+            fx.repo_id,
+            &version("keep", "2.0"),
+            "forensics",
+            fx.user_id,
+            &fx.username,
+        )
+        .await
+        .expect("block");
+        let checksum: String =
+            sqlx::query_scalar("SELECT checksum_sha256 FROM artifacts WHERE id = $1")
+                .bind(blocked)
+                .fetch_one(&fx.pool)
+                .await
+                .unwrap();
+
+        let checked = crate::api::handlers::cleanup_soft_deleted_artifact_checked(
+            &fx.pool,
+            &crate::models::repository::RepositoryFormat::Generic,
+            fx.repo_id,
+            "keep/2.0/keep.bin",
+            &checksum,
+        )
+        .await;
+        crate::api::handlers::cleanup_soft_deleted_artifact(
+            &fx.pool,
+            fx.repo_id,
+            "keep/2.0/keep.bin",
+        )
+        .await;
+        crate::api::handlers::cleanup_soft_deleted_artifact(
+            &fx.pool,
+            fx.repo_id,
+            "free/2.0/free.bin",
+        )
+        .await;
+        let blocked_kept = row_exists(&fx, blocked).await;
+        let control_kept = row_exists(&fx, control).await;
+        fx.teardown().await;
+
+        assert!(
+            matches!(checked, Err(AppError::Immutable(_))),
+            "{checked:?}"
+        );
+        assert!(blocked_kept);
+        assert!(!control_kept, "an ordinary tombstone is still purged");
     }
 }
