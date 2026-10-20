@@ -349,7 +349,7 @@ impl AppError {
     }
 
     /// Map error variant to HTTP status code and machine-readable error code.
-    fn status_and_code(&self) -> (StatusCode, &'static str) {
+    pub(crate) fn status_and_code(&self) -> (StatusCode, &'static str) {
         match self {
             Self::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, "CONFIG_ERROR"),
             // SQLx pool exhaustion is a transient capacity problem, not a

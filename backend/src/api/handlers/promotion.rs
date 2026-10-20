@@ -78,6 +78,11 @@ pub struct PromotionResponse {
     pub promotion_id: Option<Uuid>,
     pub policy_violations: Vec<PolicyViolation>,
     pub message: Option<String>,
+    /// The stable error code of a refusal that has one, e.g.
+    /// `IMMUTABLE_RELEASE` (#5), so a bulk item can be told apart without
+    /// matching on `message`. Absent on success and on gate/rule refusals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     /// Every gate rule the promotion was evaluated against, passed or not,
     /// with the reason: `[{"rule","passed","reason"}]`. Empty when the policy
     /// check was skipped or never reached.
@@ -823,6 +828,7 @@ fn quality_gate_block_result(message: &str) -> GateResult {
 
 fn failed_response(source: String, target: String, message: String) -> PromotionResponse {
     PromotionResponse {
+        code: None,
         promoted: false,
         source,
         target,
@@ -1245,6 +1251,7 @@ pub async fn promote_artifact(
 
         if !eval_result.passed && eval_result.action == PolicyAction::Block {
             let refusal = PromotionResponse {
+                code: None,
                 promoted: false,
                 source: build_promotion_source_display(&repo_key, &artifact.path),
                 target: build_promotion_target_display(&target_key, &artifact.path),
@@ -1272,6 +1279,7 @@ pub async fn promote_artifact(
             .await?;
         if !failing.is_empty() {
             let refusal = PromotionResponse {
+                code: None,
                 promoted: false,
                 source: build_promotion_source_display(&repo_key, &artifact.path),
                 target: build_promotion_target_display(&target_key, &artifact.path),
@@ -1729,7 +1737,10 @@ pub async fn promote_artifacts_bulk(
         .await
         {
             failed += 1;
-            let resp = failed_response(source_display, target_display, e.to_string());
+            let resp = PromotionResponse {
+                code: Some(e.status_and_code().1.to_string()),
+                ..failed_response(source_display, target_display, e.to_string())
+            };
             audit.record(*artifact_id, &artifact.path, &resp).await;
             results.push(resp);
             continue;
@@ -1888,6 +1899,7 @@ pub async fn promote_artifacts_bulk(
 
         promoted += 1;
         let resp = PromotionResponse {
+            code: None,
             promoted: true,
             source: source_display,
             target: target_display,
@@ -2530,6 +2542,7 @@ fn build_success_response(
     policy_violations: Vec<PolicyViolation>,
 ) -> PromotionResponse {
     PromotionResponse {
+        code: None,
         promoted: true,
         source,
         target,
@@ -3883,6 +3896,7 @@ mod tests {
     #[test]
     fn test_promotion_response_serialization() {
         let resp = PromotionResponse {
+            code: None,
             promoted: true,
             source: "staging/lib.jar".to_string(),
             target: "release/lib.jar".to_string(),
@@ -5811,6 +5825,11 @@ mod tests {
             .await
             .expect("bulk promote returns a per-item summary");
             assert_eq!((res.0.promoted, res.0.failed), (0, 1));
+            assert_eq!(
+                res.0.results[0].code.as_deref(),
+                Some("IMMUTABLE_RELEASE"),
+                "a refused bulk item carries the stable code"
+            );
             assert!(
                 res.0.results[0]
                     .message
