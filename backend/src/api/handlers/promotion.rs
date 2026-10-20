@@ -5778,7 +5778,7 @@ mod tests {
             )
             .await;
             assert!(
-                matches!(res, Err(AppError::Conflict(_))),
+                matches!(res, Err(AppError::Immutable(_))),
                 "different bytes over a released tombstone must be a 409; got {:?}",
                 res.map(|r| r.0.promoted)
             );
