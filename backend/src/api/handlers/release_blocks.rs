@@ -250,13 +250,16 @@ pub async fn block_release(
     Json(req): Json<ReleaseBlockRequest>,
 ) -> Result<(StatusCode, Json<ReleaseBlockResponse>)> {
     let auth = require_auth(auth)?;
-    let repo = authorize_release_admin(&state, &auth, &key).await?;
+    // The request is validated before authorization, so a missing or blank
+    // reason is a 400 whoever sends it, as on the audited override (#10).
     let coordinate = ReleaseCoordinate::parse(&coordinate, req.name.as_deref())?;
+    let reason = blocks::validate_reason(&req.reason)?;
+    let repo = authorize_release_admin(&state, &auth, &key).await?;
     let block = blocks::block(
         &state.db,
         repo.id,
         &coordinate,
-        &req.reason,
+        reason,
         auth.user_id,
         &auth.username,
     )
@@ -305,9 +308,10 @@ pub async fn unblock_release(
     Json(req): Json<ReleaseBlockRequest>,
 ) -> Result<Json<ReleaseBlockResponse>> {
     let auth = require_auth(auth)?;
-    let repo = authorize_release_admin(&state, &auth, &key).await?;
+    // Validated before authorization, as in `block_release`.
     let coordinate = ReleaseCoordinate::parse(&coordinate, req.name.as_deref())?;
     let reason = blocks::validate_reason(&req.reason)?.to_string();
+    let repo = authorize_release_admin(&state, &auth, &key).await?;
     let block = blocks::unblock(&state.db, repo.id, &coordinate).await?;
     record_block_action(
         &state,
@@ -626,7 +630,20 @@ mod tests {
             tdh::send(app(&fx, Some(auth)), json_post(uri, body))
         };
 
-        let (member, _) = send(repo_admin(&fx), uri("block"), body.clone()).await;
+        // A write-capable member who is not a repository admin. A separate
+        // principal, because the permission service caches decisions.
+        let (member_id, member_name) = tdh::create_user(&fx.pool).await;
+        tdh::grant_repo_access(&fx.pool, fx.repo_id, member_id).await;
+        let member_auth = tdh::make_auth(member_id, &member_name);
+        let (member, _) = send(member_auth.clone(), uri("block"), body.clone()).await;
+        // Validation comes first: a blank reason is a 400 even from a caller
+        // who could not block.
+        let (member_blank, _) = send(
+            member_auth,
+            uri("block"),
+            serde_json::json!({ "name": "lib", "reason": " " }),
+        )
+        .await;
         tdh::grant_repo_admin(&fx.pool, fx.repo_id, fx.user_id).await;
         let (blank, _) = send(
             repo_admin(&fx),
@@ -663,12 +680,14 @@ mod tests {
         .await;
         let (anon, _) = tdh::send(app(&fx, None), json_post(uri("block"), body)).await;
         fx.teardown().await;
+        tdh::cleanup_user(&fx.pool, member_id).await;
 
         assert_eq!(
             member,
             StatusCode::FORBIDDEN,
             "write access alone must not block"
         );
+        assert_eq!(member_blank, StatusCode::BAD_REQUEST);
         assert_eq!(blank, StatusCode::BAD_REQUEST);
         assert_eq!(missing_reason, StatusCode::BAD_REQUEST);
         assert_eq!(unknown, StatusCode::NOT_FOUND);
