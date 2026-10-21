@@ -124,17 +124,23 @@ pub async fn cleanup_soft_deleted_artifact_checked(
         )
         .fetch_optional(db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?;
+        .map_err(|e| AppError::Database(e.to_string()))?
+        .map(|r| (r.checksum_sha256, r.version));
+        // #4812: after storage GC reclaimed the tombstone, compare against the
+        // coordinate it remembered instead.
+        let prior = match prior {
+            Some(row) => Some(row),
+            None => {
+                crate::services::artifact_service::reclaimed_release_record(db, repository_id, path)
+                    .await?
+            }
+        };
 
-        if let Some(prior) = prior {
+        if let Some((prior_sha256, prior_version)) = prior {
             // Released = versioned coordinate or structurally immutable path.
             let is_released =
-                prior.version.is_some() || cache_classifier::classify(format, path).is_immutable();
-            if is_released
-                && !prior
-                    .checksum_sha256
-                    .eq_ignore_ascii_case(new_checksum_sha256)
-            {
+                prior_version.is_some() || cache_classifier::classify(format, path).is_immutable();
+            if is_released && !prior_sha256.eq_ignore_ascii_case(new_checksum_sha256) {
                 return Err(AppError::Immutable(
                     "Artifact version already exists and is immutable".to_string(),
                 ));
@@ -1266,6 +1272,53 @@ mod tests {
         );
 
         cleanup_repo(&pool, repo).await;
+    }
+
+    /// #4812: once storage GC has reclaimed the tombstone, the checked purge
+    /// compares against the coordinate GC remembered: different bytes are
+    /// refused, the identical bytes still proceed.
+    #[tokio::test]
+    async fn checked_cleanup_refuses_swap_at_a_gc_reclaimed_release() {
+        let Some(pool) = crate::api::handlers::test_db_helpers::try_pool().await else {
+            return;
+        };
+        let repo = make_repo(&pool, "maven").await;
+        let path = "com/x/gc/1.0.0/gc-1.0.0.jar";
+        let released = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        sqlx::query(
+            "INSERT INTO released_coordinates (repository_id, path, checksum_sha256, version) \
+             VALUES ($1, $2, $3, '1.0.0')",
+        )
+        .bind(repo)
+        .bind(path)
+        .bind(released)
+        .execute(&pool)
+        .await
+        .expect("seed reclaimed coordinate");
+
+        let swap = cleanup_soft_deleted_artifact_checked(
+            &pool,
+            &RepositoryFormat::Maven,
+            repo,
+            path,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .await;
+        let same = cleanup_soft_deleted_artifact_checked(
+            &pool,
+            &RepositoryFormat::Maven,
+            repo,
+            path,
+            released,
+        )
+        .await;
+        cleanup_repo(&pool, repo).await;
+
+        assert!(
+            matches!(swap, Err(crate::error::AppError::Immutable(_))),
+            "different bytes at a GC-reclaimed release must 409; got {swap:?}"
+        );
+        assert!(same.is_ok(), "identical bytes still proceed: {same:?}");
     }
 
     #[tokio::test]

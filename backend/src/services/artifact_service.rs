@@ -218,16 +218,21 @@ pub(crate) async fn refuse_released_byte_swap(
     )
     .fetch_optional(db)
     .await
-    .map_err(|e| AppError::Database(e.to_string()))?;
+    .map_err(|e| AppError::Database(e.to_string()))?
+    .map(|r| (r.checksum_sha256, r.version));
+    let prior = match prior {
+        Some(row) => Some(row),
+        None => reclaimed_release_record(db, repository_id, path).await?,
+    };
 
     // Only a *released* coordinate is immutable: either the structural
     // classifier marks it immutable, or the prior row was published as a
     // versioned artifact (version IS NOT NULL). A path-less, version-less
     // generic blob remains freely replaceable.
-    if let Some(prior) = prior {
-        let is_released = prior.version.is_some()
+    if let Some((prior_sha256, prior_version)) = prior {
+        let is_released = prior_version.is_some()
             || crate::services::cache_classifier::classify(&repo.format, path).is_immutable();
-        if is_released && !prior.checksum_sha256.eq_ignore_ascii_case(checksum_sha256) {
+        if is_released && !prior_sha256.eq_ignore_ascii_case(checksum_sha256) {
             return Err(AppError::Immutable(
                 "Artifact version already exists and is immutable".to_string(),
             ));
@@ -235,6 +240,29 @@ pub(crate) async fn refuse_released_byte_swap(
     }
 
     Ok(())
+}
+
+/// The `(checksum_sha256, version)` storage GC remembered for
+/// `(repository_id, path)` when it reclaimed the tombstone there (#4812).
+///
+/// Both release-immutability backstops fall back to this once no `artifacts`
+/// row is left at the path: [`refuse_released_byte_swap`] for service-backed
+/// uploads and `cleanup_soft_deleted_artifact_checked` for the format handlers
+/// that insert their own rows.
+pub(crate) async fn reclaimed_release_record(
+    db: &PgPool,
+    repository_id: Uuid,
+    path: &str,
+) -> Result<Option<(String, Option<String>)>> {
+    sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT checksum_sha256, version FROM released_coordinates \
+         WHERE repository_id = $1 AND path = $2",
+    )
+    .bind(repository_id)
+    .bind(path)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))
 }
 
 /// Whether uploads to a repository append immutable revisions to

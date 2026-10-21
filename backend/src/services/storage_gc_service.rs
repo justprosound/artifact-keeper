@@ -915,6 +915,27 @@ impl CleanupSweepKind {
     }
 }
 
+/// Copy the coordinate and digest of every tombstone GC is about to reclaim
+/// for one storage key into `released_coordinates` (#4812). Scoped exactly
+/// like the hard-delete it precedes.
+///
+/// A record that was *released* (version set) is kept as it is, so it only
+/// ever describes the bytes that were released. A record without a version
+/// is replaced by a later reclaimed row: an unversioned blob reclaimed first
+/// must not shadow a release reclaimed at the same path afterwards.
+pub(crate) const RECORD_RECLAIMED_COORDINATES_SQL: &str = "INSERT INTO released_coordinates \
+     (repository_id, path, checksum_sha256, version) \
+     SELECT a.repository_id, a.path, a.checksum_sha256, a.version \
+     FROM artifacts a JOIN repositories r ON r.id = a.repository_id \
+     WHERE a.storage_key = $1 AND a.is_deleted = true \
+       AND r.storage_backend = $2 \
+       AND (r.storage_backend <> 'filesystem' OR r.storage_path = $3) \
+     ON CONFLICT (repository_id, path) DO UPDATE \
+       SET checksum_sha256 = EXCLUDED.checksum_sha256, \
+           version = EXCLUDED.version, \
+           reclaimed_at = NOW() \
+       WHERE released_coordinates.version IS NULL";
+
 impl StorageGcService {
     pub fn new(db: PgPool, storage_registry: Arc<StorageRegistry>) -> Self {
         Self {
@@ -1432,6 +1453,23 @@ impl StorageGcService {
         {
             let _ = tx.rollback().await;
             let msg = format_gc_error("delete promotion_approvals", &storage_key, &e.to_string());
+            tracing::warn!("{}", msg);
+            result.errors.push(msg);
+            return;
+        }
+
+        // #4812: remember each reclaimed tombstone's coordinate and digest, so
+        // the release-immutability backstop still refuses different bytes at
+        // that path once the row below is gone. Same scope as the delete.
+        if let Err(e) = sqlx::query(RECORD_RECLAIMED_COORDINATES_SQL)
+            .bind(&storage_key)
+            .bind(&storage_backend)
+            .bind(&storage_path)
+            .execute(&mut *tx)
+            .await
+        {
+            let _ = tx.rollback().await;
+            let msg = format_gc_error("record released coordinates", &storage_key, &e.to_string());
             tracing::warn!("{}", msg);
             result.errors.push(msg);
             return;
@@ -4513,6 +4551,77 @@ mod tests {
     use bytes::Bytes;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    /// #4812: record the reclaimed tombstone at `path` (version `version`,
+    /// digest `sha`) over an existing record, and return what is recorded.
+    async fn record_over(
+        fx: &crate::api::handlers::test_db_helpers::Fixture,
+        path: &str,
+        existing: (&str, Option<&str>),
+        reclaimed: (&str, Option<&str>),
+    ) -> (String, Option<String>) {
+        sqlx::query(
+            "INSERT INTO released_coordinates (repository_id, path, checksum_sha256, version) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(fx.repo_id)
+        .bind(path)
+        .bind(existing.0)
+        .bind(existing.1)
+        .execute(&fx.pool)
+        .await
+        .expect("seed record");
+        let key = format!("rc/{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO artifacts (repository_id, path, name, version, size_bytes, \
+                 checksum_sha256, content_type, storage_key, is_deleted) \
+             VALUES ($1, $2, 'rc', $3, 1, $4, 'application/octet-stream', $5, true)",
+        )
+        .bind(fx.repo_id)
+        .bind(path)
+        .bind(reclaimed.1)
+        .bind(reclaimed.0)
+        .bind(&key)
+        .execute(&fx.pool)
+        .await
+        .expect("seed tombstone");
+        let (backend, root): (String, String) =
+            sqlx::query_as("SELECT storage_backend, storage_path FROM repositories WHERE id = $1")
+                .bind(fx.repo_id)
+                .fetch_one(&fx.pool)
+                .await
+                .expect("repo storage");
+        sqlx::query(RECORD_RECLAIMED_COORDINATES_SQL)
+            .bind(&key)
+            .bind(&backend)
+            .bind(&root)
+            .execute(&fx.pool)
+            .await
+            .expect("record reclaimed coordinates");
+        crate::services::artifact_service::reclaimed_release_record(&fx.pool, fx.repo_id, path)
+            .await
+            .expect("read record")
+            .expect("record present")
+    }
+
+    /// #4812: a released record is never replaced, while an unversioned one
+    /// gives way to a release reclaimed later at the same path.
+    #[tokio::test]
+    async fn released_coordinate_record_keeps_releases_and_upgrades_blobs() {
+        let Some(fx) =
+            crate::api::handlers::test_db_helpers::Fixture::setup("local", "generic").await
+        else {
+            return;
+        };
+        let p1 = format!("rc-{}/1.0.0/a.bin", Uuid::new_v4().simple());
+        let kept = record_over(&fx, &p1, ("aa", Some("1.0.0")), ("bb", Some("1.0.0"))).await;
+        let p2 = format!("rc-{}/blob.bin", Uuid::new_v4().simple());
+        let upgraded = record_over(&fx, &p2, ("aa", None), ("bb", Some("1.0.0"))).await;
+        fx.teardown().await;
+
+        assert_eq!(kept, ("aa".to_string(), Some("1.0.0".to_string())));
+        assert_eq!(upgraded, ("bb".to_string(), Some("1.0.0".to_string())));
+    }
 
     /// #3368: GC must not delete proxy-cache OBJECTS, but must still reap the
     /// stale `artifacts` ROWS that name them.

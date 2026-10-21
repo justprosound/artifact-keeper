@@ -845,4 +845,94 @@ mod tests {
             "Schema should contain OciBlobRepoFootprint"
         );
     }
+
+    /// #4 (release immutability): a storage GC pass that reclaims a released
+    /// tombstone must not reopen its coordinate. Release -> non-admin delete
+    /// (Generic classifies the path mutable, so the delete guard permits it)
+    /// -> live GC -> re-upload of DIFFERENT bytes must still 409. Before the
+    /// fix GC hard-deleted the only row the release-immutability backstop
+    /// compares against, so the swap succeeded.
+    #[tokio::test]
+    async fn gc_reclaimed_release_tombstone_still_refuses_different_bytes_db() {
+        use crate::api::handlers::repositories::{
+            delete_artifact, upload_artifact, DeleteArtifactQuery,
+        };
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{HeaderMap, StatusCode};
+
+        let _gc_guard = crate::services::storage_gc_service::storage_gc_test_guard().await;
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        tdh::grant_repo_actions(
+            &fx.pool,
+            fx.repo_id,
+            fx.user_id,
+            &["read", "write", "delete"],
+        )
+        .await;
+        let auth = Some(tdh::make_auth(fx.user_id, &fx.username));
+        // {package}/{version}/{filename}: a versioned release coordinate.
+        let path = format!("app-{}/1.0.0/app-1.0.0.bin", uuid::Uuid::new_v4().simple());
+        let put = |bytes: &'static [u8]| {
+            upload_artifact(
+                State(fx.state.clone()),
+                Extension(auth.clone()),
+                Path((fx.repo_key.clone(), path.clone())),
+                HeaderMap::new(),
+                Body::from(bytes),
+            )
+        };
+        let rows_at_path = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+            )
+            .bind(fx.repo_id)
+            .bind(&path)
+            .fetch_one(&fx.pool)
+            .await
+            .expect("count rows at path")
+        };
+
+        let published = put(b"ORIGINAL-RELEASE-BYTES").await;
+        let deleted = delete_artifact(
+            State(fx.state.clone()),
+            Extension(auth.clone()),
+            Path((fx.repo_key.clone(), path.clone())),
+            Query(DeleteArtifactQuery::default()),
+            HeaderMap::new(),
+        )
+        .await;
+        let gc = StorageGcService::new(fx.pool.clone(), fx.state.storage_registry.clone())
+            .with_trash_retention_days(0)
+            .run_gc(false)
+            .await;
+        let rows_after_gc = rows_at_path().await;
+        let swap = put(b"SWAPPED-RELEASE-BYTES").await;
+        let identical = put(b"ORIGINAL-RELEASE-BYTES").await;
+        fx.teardown().await;
+
+        assert!(published.is_ok(), "initial publish: {published:?}");
+        assert!(
+            deleted.is_ok(),
+            "non-admin delete of the release: {deleted:?}"
+        );
+        assert!(gc.is_ok(), "live GC pass: {gc:?}");
+        // Positive control: GC really reclaimed the tombstone, so the 409
+        // below cannot come from the soft-delete backstop.
+        assert_eq!(
+            rows_after_gc, 0,
+            "GC must hard-delete the released tombstone"
+        );
+        assert_eq!(
+            swap.as_ref().err().map(|r| r.status()),
+            Some(StatusCode::CONFLICT),
+            "different bytes at a GC-reclaimed release coordinate must 409, got: {swap:?}"
+        );
+        assert!(
+            identical.is_ok(),
+            "re-publishing the identical bytes stays allowed: {identical:?}"
+        );
+    }
 }
