@@ -1649,11 +1649,10 @@ async fn upload_module(
     })?;
 
     if existing.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("Module {} version {} already exists", module_name, version),
-        )
-            .into_response());
+        return Err(super::immutable_release(format!(
+            "Module {} version {} already exists",
+            module_name, version
+        )));
     }
 
     // Stream the request body to a bounded scratch file, computing the content
@@ -2399,14 +2398,10 @@ async fn upload_provider(
     })?;
 
     if existing.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "Provider {} version {} for {} already exists",
-                provider_name, version, platform
-            ),
-        )
-            .into_response());
+        return Err(super::immutable_release(format!(
+            "Provider {} version {} for {} already exists",
+            provider_name, version, platform
+        )));
     }
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
@@ -6998,6 +6993,62 @@ mod tests {
             serde_json::json!({ "versions": { "1.0.0": {}, "2.0.0": {} } }),
             "an expired hold must be listable again, matching check_download_allowed"
         );
+    }
+
+    /// #5: re-publishing a released module or provider version with different
+    /// bytes is refused 409 with the stable `IMMUTABLE_RELEASE` code, not a
+    /// plain-text 409 a client cannot tell from any other conflict.
+    #[tokio::test]
+    async fn republishing_a_released_module_or_provider_is_immutable_release_5() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "terraform").await else {
+            return;
+        };
+        let module_uri = format!(
+            "{}/{}/v1/modules/acme/frozen/aws/1.0.0",
+            MOUNT_PREFIX, fx.repo_key
+        );
+        let provider_uri = format!(
+            "{}/{}/v1/providers/acme/frozen/1.0.0/linux/amd64",
+            MOUNT_PREFIX, fx.repo_key
+        );
+        let mut results = Vec::new();
+        for uri in [&module_uri, &provider_uri] {
+            let first = tdh::send(
+                fx.router_with_auth(mounted_router()),
+                tdh::put(uri.clone(), Bytes::from_static(b"PK\x03\x04first-bytes")),
+            )
+            .await;
+            let second = tdh::send(
+                fx.router_with_auth(mounted_router()),
+                tdh::put(uri.clone(), Bytes::from_static(b"PK\x03\x04other-bytes")),
+            )
+            .await;
+            results.push((uri.clone(), first, second));
+        }
+        fx.teardown().await;
+
+        for (uri, (first_status, first_body), (status, body)) in results {
+            assert!(
+                first_status.is_success(),
+                "first publish of {uri}: {first_status} {}",
+                String::from_utf8_lossy(&first_body)
+            );
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "republish of {uri}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let json: serde_json::Value = serde_json::from_slice(&body)
+                .unwrap_or_else(|e| panic!("{uri}: body is not JSON ({e})"));
+            assert_eq!(
+                json["code"],
+                crate::error::IMMUTABLE_RELEASE_CODE,
+                "{uri}: {json}"
+            );
+        }
     }
 }
 

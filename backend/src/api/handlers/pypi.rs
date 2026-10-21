@@ -6372,7 +6372,7 @@ async fn upload(
     .map_err(map_db_err)?;
 
     if existing.is_some() {
-        return Err(AppError::Conflict("File already exists".to_string()).into_response());
+        return Err(AppError::Immutable("File already exists".to_string()).into_response());
     }
 
     // Build metadata JSON
@@ -20345,6 +20345,46 @@ long description body\n";
                 "{body}"
             );
         }
+    }
+
+    /// #5: uploading a distribution file that is already stored is refused
+    /// 409 with the stable `IMMUTABLE_RELEASE` code, not the generic
+    /// `CONFLICT` a promotion_only refusal or quarantine hold carries.
+    #[tokio::test]
+    async fn test_reupload_of_a_stored_file_is_immutable_release_5() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pypi").await else {
+            return;
+        };
+        let project = "ak-pypi-frozen";
+        let filename = "ak_pypi_frozen-1.0.0-py3-none-any.whl";
+        let mut results = Vec::new();
+        for content in [&b"first-wheel-bytes"[..], &b"other-wheel-bytes"[..]] {
+            let (content_type, body) =
+                pypi_upload_multipart(project, "1.0.0", filename, content, "frozen", ">=3.8");
+            let req = tdh::post(format!("/{}/", fx.repo_key), &content_type, body);
+            results.push(tdh::send(fx.router_with_auth(super::router()), req).await);
+        }
+        fx.teardown().await;
+
+        let (first_status, first_body) = &results[0];
+        assert_eq!(
+            *first_status,
+            StatusCode::OK,
+            "first upload: {}",
+            String::from_utf8_lossy(first_body)
+        );
+        let (status, body) = &results[1];
+        assert_eq!(
+            *status,
+            StatusCode::CONFLICT,
+            "re-upload: {}",
+            String::from_utf8_lossy(body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE, "{json}");
     }
 }
 

@@ -78,7 +78,9 @@ pub struct ApiDoc;
 /// Standard error response body returned by all endpoints on failure.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct ErrorResponse {
-    /// Machine-readable error code (e.g. "NOT_FOUND", "VALIDATION_ERROR")
+    /// Machine-readable error code (e.g. "NOT_FOUND", "VALIDATION_ERROR").
+    /// "IMMUTABLE_RELEASE" (409) is the stable code of every
+    /// release-immutability refusal, distinct from the generic "CONFLICT".
     pub code: String,
     /// Human-readable error message
     pub message: String,
@@ -717,6 +719,39 @@ mod tests {
             "{description}"
         );
         assert!(description.contains("response body"), "{description}");
+        assert!(description.contains("IMMUTABLE_RELEASE"), "{description}");
+    }
+
+    /// #5: every documented write that can refuse on release immutability
+    /// names the stable `IMMUTABLE_RELEASE` code in its 409, so generated
+    /// clients can tell it apart from other conflicts. The direct PUT
+    /// upload documented no 409 at all.
+    #[test]
+    fn test_openapi_immutability_409s_name_the_stable_code() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        let paths = spec["paths"].as_object().unwrap();
+        for (suffix, method) in [
+            ("/uploads/{session_id}/complete", "put"),
+            ("/repositories/{key}/artifacts/{path}", "put"),
+            ("/repositories/{key}/artifacts/{path}", "delete"),
+        ] {
+            let (_, item) = paths
+                .iter()
+                .find(|(p, _)| p.ends_with(suffix))
+                .unwrap_or_else(|| panic!("{suffix} missing from OpenAPI spec"));
+            let response = &item[method]["responses"]["409"];
+            let description = response["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{method} {suffix} must document a 409 response"));
+            assert!(
+                description.contains(crate::error::IMMUTABLE_RELEASE_CODE),
+                "{method} {suffix}: {description}"
+            );
+            assert!(
+                response["content"]["application/json"]["schema"].is_object(),
+                "{method} {suffix}: the 409 must carry the ErrorResponse body"
+            );
+        }
     }
 
     /// Verify every path documented in the OpenAPI spec has a corresponding

@@ -15,6 +15,14 @@ const RETRY_AFTER_SECS_ON_503: &str = "1";
 /// Application result type alias
 pub type Result<T> = std::result::Result<T, AppError>;
 
+/// Machine-readable code of every release-immutability refusal (#5): an
+/// upload onto a released coordinate, a delete-then-reupload of different
+/// bytes, or a delete of a released artifact. Formats whose clients need
+/// their own error envelope (cargo `errors`, pub `error`) carry this same
+/// code inside it, so a client can tell an immutability refusal apart from a
+/// quarantine hold or any other 409 without matching on message text.
+pub const IMMUTABLE_RELEASE_CODE: &str = "IMMUTABLE_RELEASE";
+
 /// Detect filesystem name-too-long errors across the message strings that
 /// surface from std::io and object_store/S3 backends. Linux io::Error
 /// renders as "File name too long (os error 36)"; some layers prefix or
@@ -174,9 +182,16 @@ pub enum AppError {
     #[error("Resource not found: {0}")]
     NotFound(String),
 
-    /// Duplicate resource (e.g., artifact version already exists)
+    /// Duplicate resource (e.g., a repository key already exists)
     #[error("Conflict: {0}")]
     Conflict(String),
+
+    /// A released coordinate may not be overwritten or deleted (#5). A 409
+    /// like [`Self::Conflict`], but with the stable [`IMMUTABLE_RELEASE_CODE`]
+    /// so clients do not have to match on the message to tell it apart from
+    /// a quarantine hold or another conflict.
+    #[error("Immutable release: {0}")]
+    Immutable(String),
 
     #[error("Validation error: {0}")]
     Validation(String),
@@ -361,6 +376,7 @@ impl AppError {
             Self::Authorization(_) => (StatusCode::FORBIDDEN, "FORBIDDEN"),
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "NOT_FOUND"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
+            Self::Immutable(_) => (StatusCode::CONFLICT, IMMUTABLE_RELEASE_CODE),
             Self::Validation(_) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR"),
             Self::CodedValidation { code, .. } => (StatusCode::BAD_REQUEST, code),
             Self::UnprocessableEntity(_) => {
@@ -475,6 +491,7 @@ impl AppError {
             | Self::Authorization(msg)
             | Self::NotFound(msg)
             | Self::Conflict(msg)
+            | Self::Immutable(msg)
             | Self::Validation(msg)
             | Self::UnprocessableEntity(msg)
             | Self::QuotaExceeded(msg)
@@ -538,6 +555,8 @@ impl IntoResponse for AppError {
     }
 }
 
+#[allow(clippy::disallowed_methods)]
+// streaming-invariant: test module exempt — buffering response bodies in test assertions is not an artifact path (#1608)
 #[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
@@ -850,6 +869,38 @@ mod tests {
     fn test_conflict_passes_through() {
         let err = AppError::Conflict("version already exists".into());
         assert_eq!(err.user_message(), "version already exists");
+    }
+
+    #[test]
+    fn test_immutable_is_409_with_its_own_code_and_passes_through() {
+        let err = AppError::Immutable("Artifact version already exists and is immutable".into());
+        assert_eq!(
+            err.status_and_code(),
+            (StatusCode::CONFLICT, IMMUTABLE_RELEASE_CODE)
+        );
+        assert_eq!(IMMUTABLE_RELEASE_CODE, "IMMUTABLE_RELEASE");
+        assert_ne!(
+            err.status_and_code().1,
+            AppError::Conflict("x".into()).status_and_code().1,
+            "an immutability refusal must be distinguishable from a plain conflict"
+        );
+        assert_eq!(
+            err.user_message(),
+            "Artifact version already exists and is immutable"
+        );
+        assert_eq!(err.log_level(), tracing::Level::INFO);
+    }
+
+    #[tokio::test]
+    async fn test_immutable_renders_the_stable_code_in_the_body() {
+        let resp = AppError::Immutable("Package already exists".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "IMMUTABLE_RELEASE");
+        assert_eq!(json["message"], "Package already exists");
     }
 
     #[test]

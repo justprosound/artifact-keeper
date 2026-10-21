@@ -1689,20 +1689,29 @@ async fn check_duplicate_crate(
     .map_err(map_db_err)?;
 
     if existing.is_some() {
-        return Err(Response::builder()
-            .status(StatusCode::CONFLICT)
-            .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::json!({"errors": [{"detail": format!(
-                    "crate version `{}@{}` already exists",
-                    name, version
-                )}]})
-                .to_string(),
-            ))
-            .unwrap());
+        return Err(cargo_immutable_response(&format!(
+            "crate version `{}@{}` already exists",
+            name, version
+        )));
     }
 
     Ok(())
+}
+
+/// A release-immutability refusal (#5) in cargo's own `errors` envelope,
+/// which `cargo publish` reads `detail` from, with the stable code beside it.
+pub(super) fn cargo_immutable_response(detail: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::CONFLICT)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({"errors": [{
+                "detail": detail,
+                "code": crate::error::IMMUTABLE_RELEASE_CODE,
+            }]})
+            .to_string(),
+        ))
+        .unwrap()
 }
 
 /// Store the .crate file and insert artifact + metadata records into the database.
@@ -1761,7 +1770,10 @@ async fn store_crate_artifact(
         checksum,
     )
     .await
-    .map_err(|e| e.into_response())?;
+    .map_err(|e| match e {
+        AppError::Immutable(detail) => cargo_immutable_response(&detail),
+        other => other.into_response(),
+    })?;
 
     let mut tx = super::publish_quota::begin_admitted_publish(
         &state.db,
@@ -6701,6 +6713,65 @@ mod tests {
             vec!["repl-crate/1.0.0/repl-crate-1.0.0.crate".to_string()],
             "only the client publish queues a push task; the replicated one must not"
         );
+    }
+
+    /// Assert a cargo `errors` envelope refusing a release-immutable publish
+    /// (#5): 409, cargo's `detail`, and the stable code beside it.
+    fn assert_cargo_immutable(status: StatusCode, body: &[u8], what: &str) {
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{what}: {}",
+            String::from_utf8_lossy(body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(body)
+            .unwrap_or_else(|e| panic!("{what}: body is not JSON ({e})"));
+        assert_eq!(
+            json["errors"][0]["code"],
+            crate::error::IMMUTABLE_RELEASE_CODE,
+            "{what}: {json}"
+        );
+        assert!(
+            json["errors"][0]["detail"].is_string(),
+            "{what}: cargo reads `detail`: {json}"
+        );
+    }
+
+    /// #5: publishing a crate version that is already live is refused with
+    /// the stable `IMMUTABLE_RELEASE` code inside cargo's `errors` envelope.
+    #[tokio::test]
+    async fn test_republish_of_a_live_version_is_immutable_release_5() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+        let uri = format!("/{}/api/v1/crates/new", fx.repo_key);
+        let first = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                uri.clone(),
+                make_publish_payload(&sample_metadata(), b"first-crate-bytes"),
+            ),
+        )
+        .await;
+        let second = tdh::send(
+            fx.router_with_auth(super::router()),
+            tdh::put(
+                uri,
+                make_publish_payload(&sample_metadata(), b"other-crate-bytes"),
+            ),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            first.0,
+            StatusCode::OK,
+            "first publish: {}",
+            String::from_utf8_lossy(&first.1)
+        );
+        assert_cargo_immutable(second.0, &second.1, "republish of a live version");
     }
 }
 

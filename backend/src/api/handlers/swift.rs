@@ -199,17 +199,26 @@ fn swift_json_response(status: StatusCode, body: serde_json::Value) -> Response 
 /// pool or an unreachable database) carries `Retry-After` like every other
 /// format's envelope (#4765).
 fn swift_error_response(status: StatusCode, detail: &str) -> Response {
+    swift_problem_response(status, serde_json::json!({ "detail": detail }))
+}
+
+/// The release-immutability 409 (#5): the registry's problem+json body with
+/// the stable `code` as an RFC 7807 extension member, so SwiftPM still reads
+/// `detail` and other clients can match on the code.
+pub(super) fn swift_immutable_response(detail: &str) -> Response {
+    swift_problem_response(
+        StatusCode::CONFLICT,
+        serde_json::json!({ "detail": detail, "code": crate::error::IMMUTABLE_RELEASE_CODE }),
+    )
+}
+
+fn swift_problem_response(status: StatusCode, problem: serde_json::Value) -> Response {
     super::with_retry_after_on_503(
         Response::builder()
             .status(status)
             .header(CONTENT_TYPE, "application/problem+json")
             .header("Content-Version", "1")
-            .body(Body::from(
-                serde_json::to_string(&serde_json::json!({
-                    "detail": detail,
-                }))
-                .unwrap(),
-            ))
+            .body(Body::from(serde_json::to_string(&problem).unwrap()))
             .unwrap(),
     )
 }
@@ -1076,8 +1085,7 @@ async fn publish_release(
     })?;
 
     if existing.is_some() {
-        return Err(swift_error_response(
-            StatusCode::CONFLICT,
+        return Err(swift_immutable_response(
             "A release with this version already exists",
         ));
     }
@@ -2377,6 +2385,62 @@ mod multipart_publish_tests {
                 "{label}: expected 400, got {status} with body {body}"
             );
         }
+    }
+
+    /// #5: publishing a release version that already exists is refused 409
+    /// with the stable code as a problem+json extension member beside the
+    /// `detail` SwiftPM reads.
+    #[tokio::test]
+    async fn republish_of_a_live_release_is_immutable_release_5() {
+        let Some(fx) = tdh::Fixture::setup("local", "swift").await else {
+            return;
+        };
+        let content_type = format!("multipart/form-data; boundary={}", BOUNDARY);
+        let uri = format!("/{}/example/FrozenPackage/1.0.0", fx.repo_key);
+        let archive = source_archive();
+        let first = tdh::send(
+            fx.router_with_auth(super::router()),
+            publish_request(
+                uri.clone(),
+                &content_type,
+                publish_envelope(&[("source-archive", "application/zip", &archive)]),
+            ),
+        )
+        .await;
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            publish_request(
+                uri,
+                &content_type,
+                publish_envelope(&[
+                    ("source-archive", "application/zip", &archive),
+                    (
+                        "metadata",
+                        "application/json",
+                        br#"{"description":"other"}"#,
+                    ),
+                ]),
+            ),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert_eq!(
+            first.0,
+            StatusCode::CREATED,
+            "first publish: {}",
+            String::from_utf8_lossy(&first.1)
+        );
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "republish: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE, "{json}");
+        assert!(json["detail"].is_string(), "SwiftPM reads `detail`: {json}");
     }
 }
 

@@ -722,11 +722,7 @@ async fn upload_package(
     .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
-        return Err(pub_error_response(
-            StatusCode::CONFLICT,
-            "CONFLICT",
-            "Package version already exists",
-        ));
+        return Err(pub_immutable_response("Package version already exists"));
     }
 
     super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
@@ -885,6 +881,16 @@ async fn finalize_upload(
 
 /// Build a Pub-spec JSON error response: `{"error": {"code": "...", "message": "..."}}`
 #[allow(clippy::result_large_err)]
+/// The release-immutability 409 (#5) in pub's `{"error": {code, message}}`
+/// envelope, with the stable code as `error.code`.
+pub(super) fn pub_immutable_response(message: &str) -> Response {
+    pub_error_response(
+        StatusCode::CONFLICT,
+        crate::error::IMMUTABLE_RELEASE_CODE,
+        message,
+    )
+}
+
 fn pub_error_response(status: StatusCode, code: &str, message: &str) -> Response {
     let json = serde_json::json!({
         "error": {
@@ -2200,6 +2206,67 @@ dev_dependencies:
             &dl_body[..],
             &archive[..],
             "the advertised archive_url must serve the published package bytes"
+        );
+    }
+
+    /// #5: uploading a version that is already published is refused 409 with
+    /// the stable code as `error.code` in pub's own envelope.
+    #[tokio::test]
+    async fn test_republish_of_a_live_version_is_immutable_release_5() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "pub").await else {
+            return;
+        };
+        let pubspec = "name: frozen_pkg\nversion: 1.0.0\n";
+        tdh::seed_artifact(
+            &fx.state,
+            &fx.pool,
+            &fx.repo_info("local", None),
+            "pub/frozen_pkg/1.0.0/frozen_pkg-1.0.0.tar.gz",
+            "frozen_pkg/1.0.0/frozen_pkg-1.0.0.tar.gz",
+            "frozen_pkg",
+            "1.0.0",
+            "application/gzip",
+            bytes::Bytes::from(archive_with_pubspec(pubspec)),
+            fx.user_id,
+        )
+        .await;
+
+        let boundary = "pub-republish-boundary";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"package.tar.gz\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(&archive_with_pubspec(&format!(
+            "{pubspec}description: other bytes\n"
+        )));
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/{}/api/packages/versions/newUpload", fx.repo_key))
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let (status, body) = tdh::send(fx.router_with_auth(super::router()), req).await;
+        fx.teardown().await;
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "republish: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(
+            json["error"]["code"],
+            crate::error::IMMUTABLE_RELEASE_CODE,
+            "{json}"
         );
     }
 }

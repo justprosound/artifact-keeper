@@ -331,7 +331,7 @@ pub async fn publish(
     let (version_id, published_at) =
         row.ok_or_else(|| AppError::NotFound("Repository version not found".to_string()))?;
     if published_at.is_some() {
-        return Err(AppError::Conflict(format!(
+        return Err(AppError::Immutable(format!(
             "Version {version_number} is already published and its @N metadata is immutable"
         )));
     }
@@ -608,7 +608,7 @@ async fn mark_published(
                 .await?;
         drop(tx);
         if still_exists.is_some() {
-            return Err(AppError::Conflict(format!(
+            return Err(AppError::Immutable(format!(
                 "Version {version_number} is already published and its @N metadata is immutable"
             )));
         }
@@ -1476,7 +1476,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, AppError::Conflict(m) if m.contains("already published")),
+            matches!(&err, AppError::Immutable(m) if m.contains("already published")),
             "{err:?}"
         );
         assert_eq!(
@@ -1841,8 +1841,8 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(republish, Err(AppError::Conflict(_))),
-            "re-publish must be Conflict(409): {republish:?}"
+            matches!(republish, Err(AppError::Immutable(_))),
+            "re-publish must be the IMMUTABLE_RELEASE 409: {republish:?}"
         );
 
         tdh::cleanup(&pool, staging, actor).await;

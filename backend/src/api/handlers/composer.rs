@@ -1709,11 +1709,10 @@ async fn upload(
     })?;
 
     if existing.is_some() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("Version {} of {} already exists", version, full_name),
-        )
-            .into_response());
+        return Err(super::immutable_release(format!(
+            "Version {} of {} already exists",
+            version, full_name
+        )));
     }
 
     super::cleanup_soft_deleted_artifact_checked(
@@ -3869,6 +3868,46 @@ mod upload_db_tests {
             vec![format!("{name}/1.2.3/{sha}.zip")],
             "only the client publish queues a push task; the replicated one must not"
         );
+    }
+
+    /// #5: re-publishing a released version with different bytes is refused
+    /// 409 with the stable `IMMUTABLE_RELEASE` code.
+    #[tokio::test]
+    async fn republish_of_a_released_version_is_immutable_release_5() {
+        let Some(f) = tdh::Fixture::setup("local", "composer").await else {
+            return;
+        };
+        let uri = format!("/{}/api/packages", f.repo_key);
+        let first = tdh::send(
+            f.router_with_auth(super::router()),
+            put_composer(
+                uri.clone(),
+                build_composer_zip("acme/frozen", "1.0.0", "first"),
+            ),
+        )
+        .await;
+        let (status, body) = tdh::send(
+            f.router_with_auth(super::router()),
+            put_composer(uri, build_composer_zip("acme/frozen", "1.0.0", "other")),
+        )
+        .await;
+        f.teardown().await;
+
+        assert!(
+            first.0.is_success(),
+            "first publish: {} {}",
+            first.0,
+            String::from_utf8_lossy(&first.1)
+        );
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "republish: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE, "{json}");
     }
 }
 

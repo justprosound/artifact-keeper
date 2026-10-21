@@ -3674,7 +3674,7 @@ async fn upload(
 
     if existing.is_some() {
         if !republishable {
-            return Err(AppError::Conflict("Artifact already exists".to_string()).into_response());
+            return Err(AppError::Immutable("Artifact already exists".to_string()).into_response());
         }
         // A republishable coordinate (a SNAPSHOT file, maven-metadata) is
         // rewritten in place by the `ON CONFLICT` upsert below (#3587) — no
@@ -3840,7 +3840,9 @@ async fn upload(
         // row: a concurrent PUT won the race between the duplicate check above
         // and this statement. Answer it the same 409 the check itself would
         // have, rather than the 500 the bare INSERT raised (#3587).
-        .ok_or_else(|| AppError::Conflict("Artifact already exists".to_string()).into_response())?;
+        .ok_or_else(|| {
+            AppError::Immutable("Artifact already exists".to_string()).into_response()
+        })?;
 
     // The durable attribution claim for this key was already committed by the
     // atomic `claim_flat_key_for_write` gate above (before the put), so it is

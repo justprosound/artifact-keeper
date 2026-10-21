@@ -602,7 +602,7 @@ async fn push_pod(
     .map_err(crate::api::handlers::db_err)?;
 
     if existing.is_some() {
-        return Err((StatusCode::CONFLICT, "Pod version already exists").into_response());
+        return Err(super::immutable_release("Pod version already exists"));
     }
 
     // Refuse an over-quota upload before a soft-deleted row at this path is
@@ -2006,6 +2006,50 @@ mod db_cov_tests {
             vec!["Repl4725/1.0.0/Repl4725-1.0.0.tar.gz".to_string()],
             "only the client push queues a push task; the replicated one must not"
         );
+    }
+
+    /// #5: pushing a released pod version again with different bytes is
+    /// refused 409 with the stable `IMMUTABLE_RELEASE` code.
+    #[tokio::test]
+    async fn test_cocoapods_republish_of_a_released_version_is_immutable_release_5() {
+        let Some(fx) = tdh::Fixture::setup("local", "cocoapods").await else {
+            return;
+        };
+        let push = |archive: Vec<u8>| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/{}/pods", fx.repo_key))
+                .body(axum::body::Body::from(archive))
+                .unwrap()
+        };
+        let first = tdh::send(
+            fx.router_with_auth(super::router()),
+            push(pod_archive("FrozenPod", "1.0.0")),
+        )
+        .await;
+        // Same name and version, different podspec bytes.
+        let (status, body) = tdh::send(
+            fx.router_with_auth(super::router()),
+            push(pod_archive_named("FrozenPod", "1.0.0")),
+        )
+        .await;
+        fx.teardown().await;
+
+        assert!(
+            first.0.is_success(),
+            "first push: {} {}",
+            first.0,
+            String::from_utf8_lossy(&first.1)
+        );
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "republish: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).unwrap_or_else(|e| panic!("body is not JSON ({e})"));
+        assert_eq!(json["code"], crate::error::IMMUTABLE_RELEASE_CODE, "{json}");
     }
 }
 
