@@ -236,6 +236,9 @@ pub fn classify(format: &RepositoryFormat, path: &str) -> Mutability {
         // maven-metadata.xml (and its checksums) is the only mutable file in a
         // Maven layout; SNAPSHOT directories are republished in place. Every
         // versioned artifact (jar/pom/war/aar/...) is immutable.
+        // An Ivy descriptor under a concrete revision is that revision's
+        // release metadata (#25); everything else follows the Maven rules.
+        RepositoryFormat::Sbt if is_released_ivy_descriptor(&lower) => Mutability::Immutable,
         RepositoryFormat::Maven | RepositoryFormat::Gradle | RepositoryFormat::Sbt => {
             classify_maven(&lower)
         }
@@ -840,13 +843,69 @@ fn has_artifact_extension(leaf: &str) -> bool {
     const EXTS: &[&str] = &[
         ".jar", ".pom", ".war", ".ear", ".aar", ".zip", ".tar.gz", ".tgz", ".module", ".klib",
     ];
-    const SIDECAR: &[&str] = &[".md5", ".sha1", ".sha256", ".sha512", ".asc"];
     // Strip a trailing checksum/signature suffix, then test the real extension.
-    let base = SIDECAR
+    let base = strip_sidecar_suffix(leaf);
+    EXTS.iter().any(|e| base.ends_with(e))
+}
+
+/// `leaf` without a trailing checksum/signature suffix (`.sha1`, `.asc`, ...).
+fn strip_sidecar_suffix(leaf: &str) -> &str {
+    const SIDECAR: &[&str] = &[".md5", ".sha1", ".sha256", ".sha512", ".asc"];
+    SIDECAR
         .iter()
         .find_map(|s| leaf.strip_suffix(s))
-        .unwrap_or(leaf);
-    EXTS.iter().any(|e| base.ends_with(e))
+        .unwrap_or(leaf)
+}
+
+/// Whether `lower` is an Ivy module descriptor of a RELEASED revision (#25):
+/// `ivy.xml` or `ivy-<rev>.xml` (or a checksum/signature sidecar of one),
+/// directly in the revision directory or under its `ivys/`, below at least an
+/// organisation and a module.
+///
+/// The descriptor carries the revision's dependencies, configurations and
+/// publications, so it is as immutable as the jars it describes. It stays
+/// mutable where the revision itself moves: a `-SNAPSHOT` directory or leaf,
+/// Ivy's `latest.*` status revisions, and dynamic revisions (`1.0.+`,
+/// `[1.0,2.0)`), none of which name one publication. A revision in the
+/// filename must pass the same test AND equal the directory's; a descriptor
+/// whose two revisions disagree is not trusted as a release.
+fn is_released_ivy_descriptor(lower: &str) -> bool {
+    let mut segments: Vec<&str> = lower.split('/').collect();
+    let Some(leaf) = segments.pop() else {
+        return false;
+    };
+    let Some(stem) = strip_sidecar_suffix(leaf).strip_suffix(".xml") else {
+        return false;
+    };
+    let file_revision = match stem {
+        "ivy" => None,
+        _ => match stem.strip_prefix("ivy-") {
+            Some(revision) => Some(revision),
+            None => return false,
+        },
+    };
+    if has_snapshot_component(lower) || leaf.contains("-snapshot") {
+        return false;
+    }
+    if segments.last() == Some(&"ivys") {
+        segments.pop();
+    }
+    // organisation / module / revision
+    if segments.len() < 3 {
+        return false;
+    }
+    let dir_revision = segments[segments.len() - 1];
+    is_concrete_ivy_revision(dir_revision)
+        && file_revision.is_none_or(|r| is_concrete_ivy_revision(r) && r == dir_revision)
+}
+
+/// Whether `revision` (lowercased) names exactly one publication: not empty,
+/// not a snapshot, not a `latest.*` status and not a dynamic range.
+fn is_concrete_ivy_revision(revision: &str) -> bool {
+    !revision.is_empty()
+        && !revision.ends_with("-snapshot")
+        && !revision.starts_with("latest.")
+        && !revision.contains(['+', '[', ']', '(', ')', ','])
 }
 
 /// PyPI distribution files: wheels, sdists, eggs (immutable once published).
@@ -1101,6 +1160,36 @@ mod tests {
                 false,
             ),
             (Sbt, "org.example/mylib/1.0.0-SNAPSHOT/ivys/ivy.xml", false),
+            // #25: a released revision's Ivy descriptor (and its sidecars) is
+            // release metadata; moving revisions keep it mutable.
+            (Sbt, "org.example/mylib/1.0.0/ivys/ivy.xml", true),
+            (Sbt, "org.example/mylib/1.0.0/ivy-1.0.0.xml", true),
+            (Sbt, "org.example/mylib/1.0.0/ivys/ivy-1.0.0.xml.sha1", true),
+            (
+                Sbt,
+                "org.example/mylib/scala_2.13/sbt_1.0/1.0.0/ivys/ivy.xml",
+                true,
+            ),
+            (Sbt, "org.example/mylib/1.0.0-SNAPSHOT/ivy-1.0.0-SNAPSHOT.xml", false),
+            (Sbt, "org.example/mylib/latest.integration/ivys/ivy.xml", false),
+            (Sbt, "org.example/mylib/1.0.+/ivys/ivy.xml", false),
+            (Sbt, "org.example/mylib/[1.0,2.0)/ivys/ivy.xml", false),
+            (Sbt, "mylib/ivys/ivy.xml", false),
+            (Sbt, "org.example/mylib/1.0.0/ivys/ivysettings.xml", false),
+            (Sbt, "org.example/mylib/maven-metadata.xml", false),
+            // #25: a revision in the descriptor's FILENAME must also name one
+            // publication, and the same one as its directory.
+            (Sbt, "org/m/1.0/ivys/ivy-1.0.xml", true),
+            (Sbt, "org/m/1.0/ivys/ivy-1.0.xml.sha1", true),
+            (Sbt, "org/m/1.0/ivys/ivy-1.0-SNAPSHOT.xml", false),
+            (Sbt, "org/m/1.0/ivys/ivy-1.0-SNAPSHOT.xml.sha1", false),
+            (Sbt, "org/m/1.0/ivys/ivy-latest.integration.xml", false),
+            (Sbt, "org/m/1.0/ivys/ivy-[1.0,2.0).xml", false),
+            (Sbt, "org/m/1.0/ivys/ivy-1.0.+.xml", false),
+            (Sbt, "org/m/1.0/ivys/ivy-2.0.xml", false),
+            (Sbt, "org/m/1.0/ivy-2.0.xml.md5", false),
+            (Sbt, "org/m/1.0/ivys/ivy-.xml", false),
+            (Sbt, "org/m/1.0/ivys/my-ivy.xml", false),
             (Maven, "com/example/app/1.0-SNAPSHOT/lib/helper.jar", false),
             // A RESOLVED unique snapshot still names exactly one deployment
             // and MUST stay immutable — including in the Ivy layout, and
