@@ -1750,18 +1750,8 @@ async fn store_crate_artifact(
         crate_bytes.len() as i64,
     )
     .await?;
-    proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
-        .await?;
-    let storage = state
-        .storage_for_repo(&repo.storage_location())
-        .map_err(|e| e.into_response())?;
-    storage
-        .put(&storage_key, crate_bytes.clone())
-        .await
-        .map_err(map_storage_err)?;
-
-    let size_bytes = crate_bytes.len() as i64;
-
+    // Before the put: the storage key is path-derived, so a refused publish
+    // must never reach the released object (#26).
     super::cleanup_soft_deleted_artifact_checked(
         &state.db,
         &crate::models::repository::RepositoryFormat::Cargo,
@@ -1774,6 +1764,18 @@ async fn store_crate_artifact(
         AppError::Immutable(detail) => cargo_immutable_response(&detail),
         other => other.into_response(),
     })?;
+
+    proxy_helpers::guard_cross_repo_write(state, repo.id, &repo.storage_backend, &storage_key)
+        .await?;
+    let storage = state
+        .storage_for_repo(&repo.storage_location())
+        .map_err(|e| e.into_response())?;
+    storage
+        .put(&storage_key, crate_bytes.clone())
+        .await
+        .map_err(map_storage_err)?;
+
+    let size_bytes = crate_bytes.len() as i64;
 
     let mut tx = super::publish_quota::begin_admitted_publish(
         &state.db,
