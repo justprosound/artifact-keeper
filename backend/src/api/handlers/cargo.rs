@@ -6797,28 +6797,6 @@ mod tests {
         );
     }
 
-    /// Assert a cargo `errors` envelope refusing a release-immutable publish
-    /// (#5): 409, cargo's `detail`, and the stable code beside it.
-    fn assert_cargo_immutable(status: StatusCode, body: &[u8], what: &str) {
-        assert_eq!(
-            status,
-            StatusCode::CONFLICT,
-            "{what}: {}",
-            String::from_utf8_lossy(body)
-        );
-        let json: serde_json::Value = serde_json::from_slice(body)
-            .unwrap_or_else(|e| panic!("{what}: body is not JSON ({e})"));
-        assert_eq!(
-            json["errors"][0]["code"],
-            crate::error::IMMUTABLE_RELEASE_CODE,
-            "{what}: {json}"
-        );
-        assert!(
-            json["errors"][0]["detail"].is_string(),
-            "{what}: cargo reads `detail`: {json}"
-        );
-    }
-
     /// #5: publishing a crate version that is already live is refused with
     /// the stable `IMMUTABLE_RELEASE` code inside cargo's `errors` envelope.
     #[tokio::test]
