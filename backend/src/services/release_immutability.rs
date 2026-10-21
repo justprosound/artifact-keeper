@@ -41,14 +41,39 @@
 //! [`Repository`] (like `format_key`): `release_immutability` (`off`/`on`,
 //! default `off`) and `immutability_exclusions` (`TEXT[]`, default empty).
 //!
-//! # Entry point for enforcement
+//! # Where it is enforced
 //!
-//! The upload oracle
-//! [`enforce_path_immutability`](crate::services::artifact_service::enforce_path_immutability)
-//! asks [`is_protected`] and refuses a protected path with
-//! [`AppError::Immutable`]. Other write, delete and lifecycle paths that
-//! touch stored bytes should ask the same question (or, holding a loaded
-//! policy, [`ReleaseImmutabilityPolicy::protects`]).
+//! Two seams, both refusing with [`AppError::Immutable`]:
+//!
+//! * **Service-backed uploads** (the generic API, chunked uploads, PyPI,
+//!   NuGet and the other formats that persist through `ArtifactService`):
+//!   [`enforce_path_immutability`](crate::services::artifact_service::enforce_path_immutability)
+//!   asks [`is_protected`] for the live overwrite and the tombstone.
+//! * **Native format handlers** that insert their own rows (Maven, npm,
+//!   Cargo, Helm and the rest):
+//!   [`purge_tombstone_checked`](crate::api::handlers::purge_tombstone_checked),
+//!   the one tombstone check they share, asks [`is_protected_by_id`] once a
+//!   tombstone exists, so a protected path counts as released whatever its
+//!   version.
+//!
+//! A native handler needs no policy check for a *live* republish: it refuses
+//! any live row at the path itself (each handler's duplicate check, or
+//! `proxy_helpers::ensure_unique_artifact_path`), or its plain `INSERT` hits
+//! `UNIQUE (repository_id, path)`. That is already stricter than the policy.
+//! The handlers that overwrite a live row in place
+//! (`ON CONFLICT (repository_id, path) DO UPDATE`) are outside the policy:
+//!
+//! * Maven, for republishable coordinates only (`-SNAPSHOT/` files and
+//!   `maven-metadata.xml`), which the policy exempts anyway.
+//! * OCI manifests and tags: digest paths are content addressed, and a tag
+//!   is a mutable pointer the classifier exempts structurally. Tag
+//!   immutability is a separate feature.
+//! * Incus image files. The handler writes storage before the row and has
+//!   no tombstone check, so even the always-on rules do not reach it. A
+//!   refusal in its row upsert would come after the bytes were replaced, so
+//!   covering it means checking before the storage write, which is a
+//!   separate item.
+//! * Conan, wholly exempt as described above.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -367,6 +392,32 @@ where
     Ok(load(db, repo.id)
         .await?
         .protects(&repo.repo_type, &repo.format, path))
+}
+
+/// [`is_protected`] for a caller that holds only the repository id and its
+/// format: the native format handlers' tombstone check
+/// ([`purge_tombstone_checked`](crate::api::handlers::purge_tombstone_checked)).
+/// A missing repository reads as unprotected.
+pub async fn is_protected_by_id<'e, E>(
+    db: E,
+    repository_id: Uuid,
+    format: &RepositoryFormat,
+    path: &str,
+) -> Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let row: Option<(RepositoryType, String, Vec<String>)> = sqlx::query_as(
+        "SELECT repo_type, release_immutability, immutability_exclusions \
+         FROM repositories WHERE id = $1",
+    )
+    .bind(repository_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(row.is_some_and(|(repo_type, mode, exclusions)| {
+        from_row((mode, exclusions)).protects(&repo_type, format, path)
+    }))
 }
 
 #[cfg(ak_test_shard = "services-2")]
@@ -845,35 +896,6 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{path} is excluded and must stay replaceable: {e:?}"));
         }
         assert_refused(fx.swap("app/2.0/app.tgz", None).await, "non-excluded path");
-        fx.done().await;
-    }
-
-    /// The Maven classifier treats an unrecognised file under a RELEASE
-    /// version as mutable, so today it is replaceable after a delete. The
-    /// policy uses the republishable test instead and protects it, while a
-    /// `-SNAPSHOT/` file stays replaceable.
-    #[tokio::test]
-    async fn maven_release_file_is_protected_and_snapshot_is_not_db() {
-        let Some(fx) = Fixture::new("maven").await else {
-            return;
-        };
-        let release = "com/x/app/1.0/app-1.0.unknownext";
-        fx.swap(release, Some("1.0"))
-            .await
-            .expect("policy off: today's behaviour, the swap succeeds");
-
-        fx.set(&on(&[])).await;
-        assert_refused(
-            fx.swap("com/x/app/1.1/app-1.1.unknownext", Some("1.1"))
-                .await,
-            "maven release file, policy on",
-        );
-        fx.swap(
-            "com/x/app/1.2-SNAPSHOT/app-1.2-SNAPSHOT.jar",
-            Some("1.2-SNAPSHOT"),
-        )
-        .await
-        .expect("a -SNAPSHOT/ file stays replaceable with the policy on");
         fx.done().await;
     }
 

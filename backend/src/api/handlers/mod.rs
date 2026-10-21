@@ -215,6 +215,9 @@ async fn prior_release_record(
 /// Refuse when `path` holds a *released* prior record (tombstone or GC record)
 /// whose bytes differ from `incoming`. The digest is resolved only when such a
 /// record exists. Genuine mutable index files are never checked.
+///
+/// A path the repository's release immutability policy (#6) protects counts
+/// as released whatever its version.
 async fn release_tombstone_accepts(
     db: &sqlx::PgPool,
     format: &crate::models::repository::RepositoryFormat,
@@ -223,19 +226,26 @@ async fn release_tombstone_accepts(
     incoming: &IncomingDigest<'_>,
 ) -> crate::error::Result<()> {
     use crate::error::AppError;
-    use crate::services::cache_classifier;
+    use crate::services::{cache_classifier, release_immutability};
 
     // Genuine in-place index files (a format's mutable pointers) are always
     // freely re-uploadable; everything else is a candidate release coordinate.
-    if cache_classifier::is_explicitly_mutable_index(format, path) {
+    // The policy has its own, narrower exemption (a Maven file under a release
+    // version is not exempt), so a path it may protect is inspected too.
+    let mutable_index = cache_classifier::is_explicitly_mutable_index(format, path);
+    if mutable_index && release_immutability::is_structurally_mutable(format, path) {
         return Ok(());
     }
     if let Some((prior_sha256, prior_version)) =
         prior_release_record(db, repository_id, path).await?
     {
-        // Released = versioned coordinate or structurally immutable path.
-        let is_released =
-            prior_version.is_some() || cache_classifier::classify(format, path).is_immutable();
+        // Released = versioned coordinate or structurally immutable path, or
+        // a path the policy protects. The policy is read only now that a prior
+        // record exists, so the common publish with none pays nothing for it.
+        let is_released = (!mutable_index
+            && (prior_version.is_some()
+                || cache_classifier::classify(format, path).is_immutable()))
+            || release_immutability::is_protected_by_id(db, repository_id, format, path).await?;
         if is_released && !prior_sha256.eq_ignore_ascii_case(&incoming.resolve().await?) {
             return Err(AppError::Immutable(
                 "Artifact version already exists and is immutable".to_string(),
@@ -524,6 +534,11 @@ mod proxy_origin_policy_tests;
 #[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod immutability_policy_api_tests;
+
+/// #6: the release immutability policy through the native format handlers.
+#[cfg(ak_test_shard = "handlers-1")]
+#[cfg(test)]
+mod immutability_policy_handler_tests;
 
 pub mod admin;
 pub mod admin_security;

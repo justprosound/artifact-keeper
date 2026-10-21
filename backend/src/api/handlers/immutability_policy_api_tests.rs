@@ -7,7 +7,8 @@
 #[cfg(test)]
 mod tests {
     use axum::extract::{Extension, Path, Query, State};
-    use axum::Json;
+
+    use crate::api::extractors::Json;
     use bytes::Bytes;
     use uuid::Uuid;
 
