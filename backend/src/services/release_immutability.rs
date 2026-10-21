@@ -48,11 +48,15 @@
 //! * **Service-backed uploads** (the generic API, chunked uploads, PyPI,
 //!   NuGet and the other formats that persist through `ArtifactService`):
 //!   [`enforce_path_immutability`](crate::services::artifact_service::enforce_path_immutability)
-//!   asks [`is_protected`] for the live overwrite and the tombstone.
+//!   asks [`is_protected`] for the live overwrite and the tombstone. The
+//!   migration upsert's
+//!   [`refuse_released_byte_swap`](crate::services::artifact_service::refuse_released_byte_swap)
+//!   asks it too.
 //! * **Native format handlers** that insert their own rows (Maven, npm,
 //!   Cargo, Helm and the rest):
-//!   [`purge_tombstone_checked`](crate::api::handlers::purge_tombstone_checked),
-//!   the one tombstone check they share, asks [`is_protected_by_id`] once a
+//!   [`purge_tombstone_checked`](crate::api::handlers::purge_tombstone_checked)
+//!   and `ensure_release_tombstone_accepts`, through the one tombstone check
+//!   they share, ask [`is_protected_by_id`] once a
 //!   tombstone exists, so a protected path counts as released whatever its
 //!   version.
 //!
