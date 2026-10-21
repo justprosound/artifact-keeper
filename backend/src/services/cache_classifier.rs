@@ -864,17 +864,27 @@ fn strip_sidecar_suffix(leaf: &str) -> &str {
 ///
 /// The descriptor carries the revision's dependencies, configurations and
 /// publications, so it is as immutable as the jars it describes. It stays
-/// mutable where the revision itself moves: a `-SNAPSHOT` directory anywhere
-/// on the path, Ivy's `latest.*` status revisions, and dynamic revisions
-/// (`1.0.+`, `[1.0,2.0)`), none of which name one publication.
+/// mutable where the revision itself moves: a `-SNAPSHOT` directory or leaf,
+/// Ivy's `latest.*` status revisions, and dynamic revisions (`1.0.+`,
+/// `[1.0,2.0)`), none of which name one publication. A revision in the
+/// filename must pass the same test AND equal the directory's; a descriptor
+/// whose two revisions disagree is not trusted as a release.
 fn is_released_ivy_descriptor(lower: &str) -> bool {
     let mut segments: Vec<&str> = lower.split('/').collect();
     let Some(leaf) = segments.pop() else {
         return false;
     };
-    let base = strip_sidecar_suffix(leaf);
-    let descriptor = base == "ivy.xml" || (base.starts_with("ivy-") && base.ends_with(".xml"));
-    if !descriptor || has_snapshot_component(lower) {
+    let Some(stem) = strip_sidecar_suffix(leaf).strip_suffix(".xml") else {
+        return false;
+    };
+    let file_revision = match stem {
+        "ivy" => None,
+        _ => match stem.strip_prefix("ivy-") {
+            Some(revision) => Some(revision),
+            None => return false,
+        },
+    };
+    if has_snapshot_component(lower) || leaf.contains("-snapshot") {
         return false;
     }
     if segments.last() == Some(&"ivys") {
@@ -884,8 +894,16 @@ fn is_released_ivy_descriptor(lower: &str) -> bool {
     if segments.len() < 3 {
         return false;
     }
-    let revision = segments[segments.len() - 1];
+    let dir_revision = segments[segments.len() - 1];
+    is_concrete_ivy_revision(dir_revision)
+        && file_revision.is_none_or(|r| is_concrete_ivy_revision(r) && r == dir_revision)
+}
+
+/// Whether `revision` (lowercased) names exactly one publication: not empty,
+/// not a snapshot, not a `latest.*` status and not a dynamic range.
+fn is_concrete_ivy_revision(revision: &str) -> bool {
     !revision.is_empty()
+        && !revision.ends_with("-snapshot")
         && !revision.starts_with("latest.")
         && !revision.contains(['+', '[', ']', '(', ')', ','])
 }
@@ -1159,6 +1177,19 @@ mod tests {
             (Sbt, "mylib/ivys/ivy.xml", false),
             (Sbt, "org.example/mylib/1.0.0/ivys/ivysettings.xml", false),
             (Sbt, "org.example/mylib/maven-metadata.xml", false),
+            // #25: a revision in the descriptor's FILENAME must also name one
+            // publication, and the same one as its directory.
+            (Sbt, "org/m/1.0/ivys/ivy-1.0.xml", true),
+            (Sbt, "org/m/1.0/ivys/ivy-1.0.xml.sha1", true),
+            (Sbt, "org/m/1.0/ivys/ivy-1.0-SNAPSHOT.xml", false),
+            (Sbt, "org/m/1.0/ivys/ivy-1.0-SNAPSHOT.xml.sha1", false),
+            (Sbt, "org/m/1.0/ivys/ivy-latest.integration.xml", false),
+            (Sbt, "org/m/1.0/ivys/ivy-[1.0,2.0).xml", false),
+            (Sbt, "org/m/1.0/ivys/ivy-1.0.+.xml", false),
+            (Sbt, "org/m/1.0/ivys/ivy-2.0.xml", false),
+            (Sbt, "org/m/1.0/ivy-2.0.xml.md5", false),
+            (Sbt, "org/m/1.0/ivys/ivy-.xml", false),
+            (Sbt, "org/m/1.0/ivys/my-ivy.xml", false),
             (Maven, "com/example/app/1.0-SNAPSHOT/lib/helper.jar", false),
             // A RESOLVED unique snapshot still names exactly one deployment
             // and MUST stay immutable — including in the Ivy layout, and
