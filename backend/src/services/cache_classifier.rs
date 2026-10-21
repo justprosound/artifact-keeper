@@ -652,10 +652,27 @@ fn classify_cargo(lower: &str) -> Mutability {
     if (lower.starts_with("crates/") || lower.contains("/crates/")) && lower.ends_with(".crate") {
         return Mutability::Immutable;
     }
+    // The hosted registry's own row layout, `<name>/<version>/<name>-<version>.crate`
+    // (#26): the exact shape `cargo publish` stores, and a released version.
+    if is_hosted_crate_path(lower) {
+        return Mutability::Immutable;
+    }
     // `config.json`, the sparse index files (`<a>/<b>/<crate>`),
     // `/api/v1/crates/<name>/<version>/download` redirects, and any stray
     // `.crate` outside the crate store are mutable / index.
     Mutability::mutable_default()
+}
+
+/// Whether `lower` is a hosted crate row path: exactly
+/// `<name>/<version>/<name>-<version>.crate`, every part non-empty. The leaf
+/// must repeat the two directories, so no sparse-index file (`<a>/<b>/<crate>`,
+/// never `.crate`) or stray `.crate` elsewhere matches.
+fn is_hosted_crate_path(lower: &str) -> bool {
+    let segments: Vec<&str> = lower.split('/').collect();
+    let [name, version, file] = segments[..] else {
+        return false;
+    };
+    !name.is_empty() && !version.is_empty() && file == format!("{name}-{version}.crate")
 }
 
 /// Debian §2.1: by-hash indices and pool/ packages are immutable; dists/
@@ -995,6 +1012,29 @@ mod tests {
                 "{f:?} coordinates must be treated as release coordinates"
             );
         }
+        // #26: Cargo, Debian and RPM derive "mutable index" from the
+        // classifier, so every HOSTED row path they store must classify as a
+        // release, while their real index files stay mutable.
+        assert!(!is_explicitly_mutable_index(
+            &Cargo,
+            "serde/1.0.0/serde-1.0.0.crate"
+        ));
+        assert!(is_explicitly_mutable_index(&Cargo, "config.json"));
+        assert!(is_explicitly_mutable_index(&Cargo, "se/rd/serde"));
+        assert!(!is_explicitly_mutable_index(
+            &Debian,
+            "pool/main/h/hello/hello_2.10-3_amd64.deb"
+        ));
+        assert!(is_explicitly_mutable_index(&Debian, "dists/stable/Release"));
+        assert!(!is_explicitly_mutable_index(
+            &Rpm,
+            "hello-2.10-1.x86_64.rpm"
+        ));
+        assert!(!is_explicitly_mutable_index(
+            &Rpm,
+            "el9/x86_64/hello-2.10-1.el9.x86_64.rpm"
+        ));
+        assert!(!is_explicitly_mutable_index(&Rpm, "hello-2.10-1.src.rpm"));
         // #2: protobuf's label map is the one pointer; a commit is a release.
         assert!(is_explicitly_mutable_index(
             &Protobuf,
@@ -1309,6 +1349,14 @@ mod tests {
             // A segment that merely ends in `crates` must not be mistaken for
             // the crate store via a loose substring match: revalidate.
             (Cargo, "mycrates/serde-1.0.0.crate", false),
+            // #26: the hosted registry's row layout is a released version...
+            (Cargo, "serde/1.0.0/serde-1.0.0.crate", true),
+            (Cargo, "my-crate/0.1.0-rc.1/my-crate-0.1.0-rc.1.crate", true),
+            // ...only in that exact shape.
+            (Cargo, "serde/1.0.0/other-1.0.0.crate", false),
+            (Cargo, "serde/1.0.0/serde-2.0.0.crate", false),
+            (Cargo, "x/serde/1.0.0/serde-1.0.0.crate", false),
+            (Cargo, "se/rd/serde", false),
             // Debian: by-hash and pool immutable; dists indices mutable.
             (Debian, "dists/bookworm/by-hash/SHA256/abc123def456", true),
             (
