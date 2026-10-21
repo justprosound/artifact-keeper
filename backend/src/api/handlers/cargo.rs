@@ -4593,6 +4593,86 @@ mod tests {
         Bytes::from(payload)
     }
 
+    /// Assert a cargo `errors` envelope refusing a release-immutable publish
+    /// (#5): 409, cargo's `detail`, and the stable code beside it.
+    fn assert_cargo_immutable(status: StatusCode, body: &[u8], what: &str) {
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{what}: {}",
+            String::from_utf8_lossy(body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(body)
+            .unwrap_or_else(|e| panic!("{what}: body is not JSON ({e})"));
+        assert_eq!(
+            json["errors"][0]["code"],
+            crate::error::IMMUTABLE_RELEASE_CODE,
+            "{what}: {json}"
+        );
+        assert!(
+            json["errors"][0]["detail"].is_string(),
+            "{what}: cargo reads `detail`: {json}"
+        );
+    }
+
+    /// #26 (restores #5's dropped test): a yanked-and-deleted (soft-deleted)
+    /// hosted crate version cannot be re-published with different bytes. The
+    /// hosted `{name}/{version}/{file}.crate` path used to classify as a
+    /// mutable index, so the tombstone check was skipped; and the check ran
+    /// after the storage write, so even a refusal would have overwritten the
+    /// released object. The identical bytes still republish.
+    #[tokio::test]
+    async fn test_republish_over_a_tombstone_is_immutable_release_5() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "cargo").await else {
+            return;
+        };
+        let uri = format!("/{}/api/v1/crates/new", fx.repo_key);
+        let publish = |bytes: &'static [u8]| {
+            tdh::send(
+                fx.router_with_auth(super::router()),
+                tdh::put(uri.clone(), make_publish_payload(&sample_metadata(), bytes)),
+            )
+        };
+        let first = publish(b"first-crate-bytes").await;
+        assert_eq!(
+            first.0,
+            StatusCode::OK,
+            "first publish: {}",
+            String::from_utf8_lossy(&first.1)
+        );
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE repository_id = $1")
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("soft-delete the published crate");
+
+        let second = publish(b"other-crate-bytes").await;
+        assert_cargo_immutable(second.0, &second.1, "republish over a tombstone");
+        let stored = fx
+            .state
+            .storage_for_repo(&fx.repo_info("local", None).storage_location())
+            .expect("storage")
+            .get("cargo/my-crate/0.1.0/my-crate-0.1.0.crate")
+            .await
+            .expect("the released object is still stored");
+        assert_eq!(
+            &stored[..],
+            b"first-crate-bytes",
+            "a refused publish must not overwrite the released object"
+        );
+
+        let again = publish(b"first-crate-bytes").await;
+        assert_eq!(
+            again.0,
+            StatusCode::OK,
+            "identical bytes must republish: {}",
+            String::from_utf8_lossy(&again.1)
+        );
+        fx.teardown().await;
+    }
+
     fn sample_metadata() -> serde_json::Value {
         serde_json::json!({
             "name": "my-crate",
