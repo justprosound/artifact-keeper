@@ -5803,6 +5803,54 @@ mod tests {
             cleanup(&pool, &[rt.src, rt.tgt], rt.user).await;
         }
 
+        /// #1 + #4: once storage GC has reclaimed the target's released
+        /// tombstone, promotion still refuses different bytes there, because
+        /// the check falls back to the coordinate GC remembered.
+        #[tokio::test]
+        async fn test_single_promote_different_bytes_over_gc_reclaimed_release_blocked() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let rt = released_target(&pool, "imm1gc", b"pr1-released-bytes").await;
+            // Simulate the GC pass: record the coordinate, drop the tombstone.
+            sqlx::query(
+                "INSERT INTO released_coordinates (repository_id, path, checksum_sha256, version) \
+                 SELECT repository_id, path, checksum_sha256, version FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND is_deleted = true",
+            )
+            .bind(rt.tgt)
+            .bind(&rt.path)
+            .execute(&pool)
+            .await
+            .expect("record reclaimed coordinate");
+            sqlx::query("DELETE FROM artifacts WHERE repository_id = $1 AND path = $2")
+                .bind(rt.tgt)
+                .bind(&rt.path)
+                .execute(&pool)
+                .await
+                .expect("reclaim tombstone");
+
+            let res = promote_artifact(
+                State(rt.state.clone()),
+                Extension(admin_ext(rt.user)),
+                Path((rt.src_key.clone(), rt.artifact)),
+                single_request(&rt),
+            )
+            .await;
+            let promoted_rows = tdh::row_state_at(&pool, rt.tgt, &rt.path).await;
+            cleanup(&pool, &[rt.src, rt.tgt], rt.user).await;
+
+            assert!(
+                matches!(res, Err(AppError::Immutable(_))),
+                "different bytes over a GC-reclaimed release must be a 409; got {:?}",
+                res.map(|r| r.0.promoted)
+            );
+            assert_eq!(
+                promoted_rows, None,
+                "no row may land at the reclaimed coordinate"
+            );
+        }
+
         /// #1: the bulk path refuses the same swap per item.
         #[tokio::test]
         async fn test_bulk_promote_different_bytes_over_release_tombstone_blocked() {
