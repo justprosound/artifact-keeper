@@ -171,8 +171,13 @@ A system admin, or a principal holding the repository `admin` action, can
 override a release-immutability refusal (`409 IMMUTABLE_RELEASE`) for one
 request by sending `X-Artifact-Keeper-Immutability-Override: true` and a reason
 in `X-Artifact-Keeper-Immutability-Override-Reason` (#10). Each decision about
-such a request writes one row. A request that does not send the header writes
-none, and neither does a request whose operation touches nothing released.
+such a request writes one row.
+
+These rows cover override attempts only. An ordinary `IMMUTABLE_RELEASE` 409
+for a request that did not send the header writes no audit row, so routine
+client republish retries do not flood the trail. Neither does a request that
+sent the header but touched nothing released. The flag without a reason is a
+400 and writes no row either: nothing was decided.
 
 | Action | Resource | Fires when | `details` |
 | --- | --- | --- | --- |
