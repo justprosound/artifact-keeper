@@ -642,7 +642,9 @@ mod tests {
     fn storage_gc_orphan_predicate_embeds_the_block_match() {
         let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
         let expected = squash(&BLOCK_MATCHES_ARTIFACT_SQL.replace("a.", "ab."));
-        let gc = squash(crate::services::storage_gc_service::orphan_predicate_sql());
+        let gc = squash(&crate::services::storage_gc_service::orphan_predicate_sql(
+            0,
+        ));
         assert!(gc.contains(&expected), "{expected}\n---\n{gc}");
     }
 

@@ -116,13 +116,6 @@ AND NOT EXISTS (
 )
 "#;
 
-/// [`ORPHAN_PREDICATE_SQL`], for the release-blocklist test that pins its
-/// block-match clause to `release_block_service` (upstream #4812).
-#[cfg(test)]
-pub(crate) fn orphan_predicate_sql() -> &'static str {
-    ORPHAN_PREDICATE_SQL
-}
-
 /// Compile-time guard: the `'oci-manifests/'` literals embedded in
 /// [`ORPHAN_PREDICATE_SQL`] (both the `LIKE` filter and the `SUBSTRING`
 /// offset) must match [`OCI_MANIFEST_STORAGE_PREFIX`](crate::storage::keys::OCI_MANIFEST_STORAGE_PREFIX). Postgres cannot
@@ -274,7 +267,7 @@ AND NOT EXISTS (
 /// re-check is a `bool_and` over every row sharing the key, an object shared
 /// by one expired and one still-retained trashed row is kept until both have
 /// expired.
-fn orphan_predicate_sql(days: u32) -> String {
+pub(crate) fn orphan_predicate_sql(days: u32) -> String {
     format!("{ORPHAN_PREDICATE_SQL}{}", trash_retention_clause(days))
 }
 

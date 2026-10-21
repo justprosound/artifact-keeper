@@ -689,13 +689,13 @@ mod tests {
             return;
         };
         seed(&fx, "svc/4.2/svc.bin", "svc", "4.2").await;
-        let repo = fx.repo_info("local", None);
+        let location = fx.repo_info("local", None).storage_location();
         let fetch = || {
             crate::api::handlers::proxy_helpers::local_fetch_by_path(
                 &fx.pool,
                 &fx.state,
                 fx.repo_id,
-                &repo.storage_location(),
+                &location,
                 "svc/4.2/svc.bin",
             )
         };
