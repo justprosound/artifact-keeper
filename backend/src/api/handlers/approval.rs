@@ -940,6 +940,34 @@ pub async fn approve_promotion(
     )
     .await?;
 
+    // Release immutability (#1): refuse before the copy and before the approval
+    // is marked approved, so a refusal leaves it pending for a reviewer.
+    if let Err(e) = super::promotion::target_release_accepts(
+        &state,
+        &target_repo,
+        &artifact.path,
+        &artifact.checksum_sha256,
+    )
+    .await
+    {
+        audit_fire_and_forget(
+            state.db.clone(),
+            AuditEntry::for_principal(AuditAction::PromotionRefused, ResourceType::Artifact, &auth)
+                .resource(artifact.id)
+                .resource_name(&artifact.path)
+                .details(serde_json::json!({
+                    "approval_id": approval_id,
+                    "artifact_id": artifact.id,
+                    "artifact_path": artifact.path,
+                    "source_repository": source_repo_key.0,
+                    "target_repository": target_repo_key.0,
+                    "message": e.to_string(),
+                })),
+        )
+        .await;
+        return Err(e);
+    }
+
     // Cross-repository write guard (#2511): the approval-execute copy re-uses the
     // SOURCE artifact's flat storage key when writing into the TARGET repo. On a
     // shared-namespace cloud backend that key may already be owned by a third
@@ -3267,6 +3295,67 @@ mod tests {
                 "break-glass approval must execute the promotion"
             );
             assert_eq!(approval_status(&pool, approval).await, "approved");
+
+            cleanup(&pool, &[src, tgt], user).await;
+            cleanup_user(&pool, requester).await;
+        }
+
+        /// #1: approving a promotion of DIFFERENT bytes onto a released,
+        /// soft-deleted coordinate in the target is refused with 409 and
+        /// audited; the tombstone and its stored bytes are untouched and the
+        /// request stays pending (not spent).
+        #[tokio::test]
+        async fn test_approval_different_bytes_over_release_tombstone_blocked() {
+            let Some(pool) = tdh::try_pool().await else {
+                return;
+            };
+            let sdir = std::env::temp_dir().join(format!("pr1-aimm-s-{}", Uuid::new_v4()));
+            let tdir = std::env::temp_dir().join(format!("pr1-aimm-t-{}", Uuid::new_v4()));
+            let src_key = make_repo_key(&pool, "aimm-s", &sdir).await;
+            let tgt_key = make_repo_key(&pool, "aimm-t", &tdir).await;
+            let src = repo_id_for_key(&pool, &src_key).await;
+            let tgt = repo_id_for_key(&pool, &tgt_key).await;
+            let user = make_admin(&pool, "aimm").await;
+            let state = tdh::build_state(pool.clone(), sdir.to_str().unwrap());
+            let storage = storage_for(&state, &pool, src).await;
+            let artifact = make_artifact(&pool, src, &storage, "aimm").await;
+            let (path,): (String,) = sqlx::query_as("SELECT path FROM artifacts WHERE id = $1")
+                .bind(artifact)
+                .fetch_one(&pool)
+                .await
+                .expect("artifact path");
+            let tgt_storage = storage_for(&state, &pool, tgt).await;
+            let released =
+                tdh::seed_release_tombstone(&pool, tgt, &tgt_storage, &path, b"pr1-released-bytes")
+                    .await;
+            let requester = make_requester(&pool, "aimm").await;
+            let approval = make_pending_approval(&pool, artifact, src, tgt, requester).await;
+
+            let res = approve_promotion(
+                State(state.clone()),
+                Extension(admin_ext(user)),
+                Path(approval),
+                Json(ReviewRequest {
+                    notes: None,
+                    skip_policy_check: false,
+                }),
+            )
+            .await;
+            assert!(
+                matches!(res, Err(AppError::Immutable(_))),
+                "different bytes over a released tombstone must be a 409; got {:?}",
+                res.map(|r| r.0.status)
+            );
+            assert_eq!(
+                tdh::row_state_at(&pool, tgt, &path).await,
+                Some((released, true)),
+                "the released tombstone must keep its bytes and stay deleted"
+            );
+            let stored = tgt_storage.get(&path).await.expect("tombstone bytes");
+            assert_eq!(&stored[..], b"pr1-released-bytes");
+            assert_eq!(approval_status(&pool, approval).await, "pending");
+            let row = tdh::audit_row_eventually(&pool, artifact, "PROMOTION_REFUSED").await;
+            assert_eq!(row.details["approval_id"], approval.to_string());
 
             cleanup(&pool, &[src, tgt], user).await;
             cleanup_user(&pool, requester).await;
