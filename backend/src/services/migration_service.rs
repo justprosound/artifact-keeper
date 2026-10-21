@@ -48,6 +48,14 @@ pub enum MigrationError {
     #[error("Storage error: {0}")]
     StorageError(String),
 
+    /// The item would replace the bytes of a released coordinate (#3). A
+    /// conflict reported on the item, not a job failure.
+    #[error(
+        "Release immutability conflict at {0}: the migrated bytes differ from the released \
+         bytes, so the release is immutable and was not replaced"
+    )]
+    ReleaseImmutable(String),
+
     #[error("Migration error: {0}")]
     Other(String),
 }

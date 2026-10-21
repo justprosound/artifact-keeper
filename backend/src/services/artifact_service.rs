@@ -180,10 +180,31 @@ pub(crate) async fn enforce_path_immutability(
     }
 
     // (2) release-immutability backstop
-    let Some(repo) = repo else {
-        return Ok(());
-    };
-    if versioning_active
+    match repo {
+        Some(repo) => {
+            refuse_released_byte_swap(db, repository_id, repo, path, checksum_sha256).await
+        }
+        None => Ok(()),
+    }
+}
+
+/// Check (2) of [`enforce_path_immutability`] on its own: refuse when
+/// `(repository_id, path)` holds a *released* row, live or soft-deleted,
+/// whose bytes differ from `checksum_sha256`.
+///
+/// For writers that legitimately refresh a live row in place and so must not
+/// run check (1): the migration upsert re-imports identical bytes over a live
+/// release as a no-op repair, but must never swap a release's bytes (#3).
+/// Versioning repositories and genuine mutable index files are exempt, as in
+/// the full check.
+pub(crate) async fn refuse_released_byte_swap(
+    db: &PgPool,
+    repository_id: Uuid,
+    repo: &Repository,
+    path: &str,
+    checksum_sha256: &str,
+) -> Result<()> {
+    if versioning_applies(&repo.format, repo.versioning_enabled)
         || crate::services::cache_classifier::is_explicitly_mutable_index(&repo.format, path)
     {
         return Ok(());
