@@ -434,7 +434,15 @@ async fn upload_plugin(
         return Err(super::immutable_release("Plugin version already exists"));
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::purge_tombstone_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Jetbrains,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Known(&computed_sha256),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     // Store the file — streamed from the staged scratch file, not a heap
     // buffer. `put_artifact_stream` performs the cross-repo write guard itself

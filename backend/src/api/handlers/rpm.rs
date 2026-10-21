@@ -2514,8 +2514,10 @@ async fn store_rpm(
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
+        &RepositoryFormat::Rpm,
         repo.id,
         &artifact_path,
+        super::IncomingDigest::Known(&computed_sha256),
         "Package already exists",
     )
     .await?;

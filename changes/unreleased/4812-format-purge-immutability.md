@@ -1,0 +1,5 @@
+---
+section: Fixed
+issues: [#4812]
+---
+- **Deleting a released version no longer lets a different file be published at the same coordinate in 20 more formats** (#4812). Alpine, Ansible, Chef, CocoaPods, CRAN, Debian, Go, Helm, Hex, Hugging Face, JetBrains, Pacman, Pub, Puppet, RPM, RubyGems, sbt, Swift, Terraform (modules and providers) and VS Code cleared a deleted release's tombstone without comparing checksums, so delete then re-upload swapped the bytes behind a version clients had already pinned. Every publish path now refuses different bytes at a deleted release with `409 IMMUTABLE_RELEASE`, in the format's own error envelope where it has one, and the check runs before the storage write so a refused upload never overwrites the released object. Git LFS and Protobuf commits, whose paths are content-addressed, go through the same check. Re-uploading the identical bytes still works, and genuinely mutable index files (Protobuf's label map, Debian `dists/` indices, Maven metadata) stay re-uploadable.

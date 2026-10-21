@@ -1553,7 +1553,15 @@ async fn store_apk(
     )
     .await?;
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::purge_tombstone_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Alpine,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Known(&computed_sha256),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     // Store the file
     let storage_key = build_alpine_storage_key(repo.id, &artifact_path);

@@ -1675,7 +1675,15 @@ async fn upload_module(
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::purge_tombstone_checked(
+        &state.db,
+        &RepositoryFormat::Terraform,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Known(&checksum),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     // Store the file, streamed from the staged scratch file.
     // `put_artifact_stream` runs the cross-repo write guard (#2584) before
@@ -2404,8 +2412,6 @@ async fn upload_provider(
         )));
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
-
     // Stream the request body to a bounded scratch file, computing the content
     // digests in one pass — never buffering the provider archive in memory
     // (#2517). The stager enforces `max_upload_size_bytes` mid-stream.
@@ -2423,6 +2429,19 @@ async fn upload_provider(
     };
 
     let storage_key = build_provider_storage_key(&namespace, &type_name, &version, &platform);
+
+    // Checked against the staged digest, before the put: the storage key is
+    // path-derived, so a released object must be refused before it is
+    // overwritten (#2).
+    super::purge_tombstone_checked(
+        &state.db,
+        &RepositoryFormat::Terraform,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Known(&checksum),
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
 
     // Store the file, streamed from the staged scratch file.
     // `put_artifact_stream` runs the cross-repo write guard (#2584) before

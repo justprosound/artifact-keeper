@@ -395,8 +395,10 @@ async fn publish_module(
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
+        &crate::models::repository::RepositoryFormat::Puppet,
         repo.id,
         &artifact_path,
+        super::IncomingDigest::Known(&computed_sha256),
         "Module version already exists",
     )
     .await?;

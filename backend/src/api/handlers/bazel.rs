@@ -596,22 +596,13 @@ async fn put_file(
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
     let checksum = format!("{:x}", Sha256::digest(&body));
-    // A deleted version stays immutable: re-publishing the same path is only
-    // allowed with identical bytes (Bazel lockfiles pin these hashes).
-    super::cleanup_soft_deleted_artifact_checked(
-        &state.db,
-        &RepositoryFormat::Bazel,
-        repo.id,
-        &artifact_path,
-        &checksum,
-    )
-    .await
-    .map_err(|e| e.into_response())?;
     let ensure_unique = || {
         proxy_helpers::ensure_unique_artifact_path(
             &state.db,
+            &RepositoryFormat::Bazel,
             repo.id,
             &artifact_path,
+            super::IncomingDigest::Known(&checksum),
             "Module file already exists",
         )
     };

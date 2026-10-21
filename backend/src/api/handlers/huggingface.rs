@@ -1146,8 +1146,10 @@ async fn upload_file_impl(
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
+        &crate::models::repository::RepositoryFormat::Huggingface,
         repo.id,
         &artifact_path,
+        super::IncomingDigest::Known(&computed_sha256),
         "File already exists at this path",
     )
     .await?;

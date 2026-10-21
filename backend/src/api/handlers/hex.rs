@@ -927,8 +927,10 @@ async fn publish_package(
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
+        &crate::models::repository::RepositoryFormat::Hex,
         repo.id,
         &artifact_path,
+        super::IncomingDigest::Known(&computed_sha256),
         "Package version already exists",
     )
     .await?;

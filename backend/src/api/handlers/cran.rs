@@ -365,8 +365,10 @@ async fn upload_package(
 
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
+        &crate::models::repository::RepositoryFormat::Cran,
         repo.id,
         &artifact_path,
+        super::IncomingDigest::Known(&computed_sha256),
         "Package version already exists",
     )
     .await?;

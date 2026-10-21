@@ -725,7 +725,15 @@ async fn upload_package(
         return Err(pub_immutable_response("Package version already exists"));
     }
 
-    super::cleanup_soft_deleted_artifact(&state.db, repo.id, &artifact_path).await;
+    super::purge_tombstone_checked(
+        &state.db,
+        &crate::models::repository::RepositoryFormat::Pub,
+        repo.id,
+        &artifact_path,
+        super::IncomingDigest::Staged(&staged),
+    )
+    .await
+    .map_err(pub_purge_refusal)?;
 
     // Stream the staged archive into the repo's StorageBackend via `put_stream`,
     // which computes the SHA-256 incrementally as it copies (no re-hash).
@@ -883,6 +891,17 @@ async fn finalize_upload(
 #[allow(clippy::result_large_err)]
 /// The release-immutability 409 (#5) in pub's `{"error": {code, message}}`
 /// envelope, with the stable code as `error.code`.
+/// Render a checked tombstone-purge failure (#2): a released-coordinate
+/// refusal in the pub envelope, anything else as its own response.
+pub(super) fn pub_purge_refusal(e: crate::error::AppError) -> Response {
+    match e {
+        crate::error::AppError::Immutable(_) => {
+            pub_immutable_response("Package version already exists")
+        }
+        other => other.into_response(),
+    }
+}
+
 pub(super) fn pub_immutable_response(message: &str) -> Response {
     pub_error_response(
         StatusCode::CONFLICT,
