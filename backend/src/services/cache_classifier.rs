@@ -587,10 +587,36 @@ fn classify_npm(lower: &str) -> Mutability {
     if lower.contains("/-/") && lower.ends_with(".tgz") {
         return Mutability::Immutable;
     }
+    // #33: a HOSTED npm publish stores its tarball at
+    // `{package}/{version}/{basename}-{version}.tgz` (`build_npm_artifact_path`),
+    // with no `/-/` segment. That exact shape is a released tarball too;
+    // otherwise every release backstop would read it as packument metadata
+    // and let a deleted version be republished with different bytes.
+    if is_hosted_npm_tarball(lower) {
+        return Mutability::Immutable;
+    }
     // `<pkg>`, `@scope/<pkg>`, `@scope%2f<pkg>`, dist-tags, the registry root,
     // and any `.tgz` NOT under `/-/` are all packument/metadata/unknown:
     // mutable (revalidate).
     Mutability::mutable_default()
+}
+
+/// `{package}/{version}/{basename}-{version}.tgz`, where `package` is `name`
+/// or `@scope/name` and `basename` is `name` (#33). The leaf must repeat both
+/// the package's basename and the version directory exactly, so a stray
+/// `.tgz` elsewhere stays on the conservative mutable default.
+fn is_hosted_npm_tarball(lower: &str) -> bool {
+    let segments: Vec<&str> = lower.trim_start_matches('/').split('/').collect();
+    let (basename, version, leaf) = match segments.as_slice() {
+        [name, version, leaf] if !name.starts_with('@') => (*name, *version, *leaf),
+        [scope, name, version, leaf] if scope.starts_with('@') && scope.len() > 1 => {
+            (*name, *version, *leaf)
+        }
+        _ => return false,
+    };
+    !basename.is_empty()
+        && !version.is_empty()
+        && leaf.strip_suffix(".tgz") == Some(format!("{basename}-{version}").as_str())
 }
 
 /// OCI §2.1: digest-pinned blobs/manifests are immutable; tags are mutable.
@@ -1636,6 +1662,85 @@ mod tests {
             "extensions/publisher/extension/1.2.3/download",
         ] {
             assert!(!classify(&Vscode, path).is_immutable(), "{path}");
+        }
+    }
+
+    /// #33 guard: for every format whose mutable-index rule is DERIVED from
+    /// `classify` (`!classify(..).is_immutable()`), the exact path its HOSTED
+    /// publish handler stores for a released version must classify as a
+    /// release coordinate. Otherwise every release-immutability backstop
+    /// treats it as a rewritable index file (the #25, #26 and npm holes). Each
+    /// row's path comes from the handler's `format!` for `artifact_path`; the
+    /// second table pins the formats' genuine index files as mutable.
+    #[test]
+    fn derived_family_hosted_publish_paths_are_releases_33() {
+        use RepositoryFormat::*;
+        let releases: &[(RepositoryFormat, &str)] = &[
+            (Maven, "com/example/app/1.0.0/app-1.0.0.jar"),
+            (Maven, "com/example/app/1.0.0/app-1.0.0.pom"),
+            (Gradle, "com/example/app/1.0.0/app-1.0.0.module"),
+            (Sbt, "com.example/app/1.0.0/ivys/ivy.xml"),
+            (Pypi, "demo-pkg/1.0.0/demo_pkg-1.0.0-py3-none-any.whl"),
+            (Pypi, "demo-pkg/1.0.0/demo_pkg-1.0.0.tar.gz"),
+            (Poetry, "demo-pkg/1.0.0/demo_pkg-1.0.0-py3-none-any.whl"),
+            (Conda, "linux-64/demo-1.0-0.conda"),
+            (Conda, "noarch/demo-1.0-0.tar.bz2"),
+            (Npm, "demo/1.0.0/demo-1.0.0.tgz"),
+            (Npm, "@acme/demo/1.0.0/demo-1.0.0.tgz"),
+            (Yarn, "demo/1.0.0/demo-1.0.0.tgz"),
+            (Pnpm, "demo/1.0.0/demo-1.0.0.tgz"),
+            (Cargo, "demo/1.0.0/demo-1.0.0.crate"),
+            (Debian, "pool/main/d/demo/demo_1.0.0_amd64.deb"),
+            (Rpm, "el9/x86_64/demo-1.0.0-1.el9.x86_64.rpm"),
+            (Docker, "v2/demo/blobs/sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            (Docker, "v2/demo/manifests/sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        ];
+        for (format, path) in releases {
+            assert!(
+                !is_explicitly_mutable_index(format, path),
+                "{format:?} hosted release path read as a mutable index: {path}"
+            );
+        }
+        let indexes: &[(RepositoryFormat, &str)] = &[
+            (Maven, "com/example/app/maven-metadata.xml"),
+            (Npm, "demo"),
+            (Npm, "@acme/demo"),
+            (Cargo, "config.json"),
+            (Cargo, "de/mo/demo"),
+            (Debian, "dists/bookworm/Release"),
+            (Rpm, "repodata/repomd.xml"),
+            (Conda, "linux-64/repodata.json"),
+            (Docker, "v2/demo/manifests/latest"),
+        ];
+        for (format, path) in indexes {
+            assert!(
+                is_explicitly_mutable_index(format, path),
+                "{format:?} index file must stay mutable: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_npm_tarballs_are_release_coordinates_33() {
+        use RepositoryFormat::Npm;
+        for path in [
+            "swapme/1.0.0/swapme-1.0.0.tgz",
+            "@acme/widget/2.3.4/widget-2.3.4.tgz",
+            "left-pad/1.0.0-rc.1/left-pad-1.0.0-rc.1.tgz",
+        ] {
+            assert!(classify(&Npm, path).is_immutable(), "{path}");
+            assert!(!is_explicitly_mutable_index(&Npm, path), "{path}");
+        }
+        for path in [
+            "swapme",
+            "@acme/widget",
+            "swapme/1.0.0/other-1.0.0.tgz",
+            "swapme/1.0.0/swapme-1.0.1.tgz",
+            "a/b/swapme/1.0.0/swapme-1.0.0.tgz",
+            "@/widget/1.0.0/widget-1.0.0.tgz",
+            "swapme/1.0.0/swapme-1.0.0.tar.gz",
+        ] {
+            assert!(!classify(&Npm, path).is_immutable(), "{path}");
         }
     }
 
