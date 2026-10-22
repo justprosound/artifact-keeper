@@ -16069,6 +16069,80 @@ mod tests {
         fx.teardown().await;
     }
 
+    /// #33: a hosted npm tarball is stored at `{package}/{version}/{file}.tgz`
+    /// (no `/-/` segment). Deleting a released version and publishing
+    /// different bytes at the same version must be refused 409
+    /// `IMMUTABLE_RELEASE`, and the identical bytes must still republish.
+    #[tokio::test]
+    async fn test_republish_over_a_deleted_hosted_tarball_is_immutable_33() {
+        use crate::api::handlers::test_db_helpers as tdh;
+
+        let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
+            return;
+        };
+        let publish_body = |tarball: &[u8]| {
+            let tarball_b64 = base64::engine::general_purpose::STANDARD.encode(tarball);
+            Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "swapme",
+                    "versions": { "1.0.0": { "name": "swapme", "version": "1.0.0" } },
+                    "_attachments": { "swapme-1.0.0.tgz": { "data": tarball_b64 } },
+                }))
+                .expect("serialize publish body"),
+            )
+        };
+        let headers = HeaderMap::new();
+        let publish = |body: Bytes| {
+            super::publish_package(
+                &fx.state,
+                Some(tdh::make_auth(fx.user_id, &fx.username)),
+                &fx.repo_key,
+                "swapme",
+                &headers,
+                body,
+            )
+        };
+        let soft_delete = || async {
+            sqlx::query(
+                "UPDATE artifacts SET is_deleted = true \
+                 WHERE repository_id = $1 AND path LIKE '%.tgz' AND is_deleted = false",
+            )
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("soft-delete the released tarball")
+            .rows_affected()
+        };
+
+        let first = publish(publish_body(b"released-tgz")).await;
+        let deleted = soft_delete().await;
+        let swapped = publish(publish_body(b"swapped-tgz")).await;
+        let identical = publish(publish_body(b"released-tgz")).await;
+        fx.teardown().await;
+
+        assert!(
+            first.is_ok(),
+            "first publish: {:?}",
+            first.err().map(|r| r.status())
+        );
+        assert_eq!(
+            deleted, 1,
+            "exactly the released tarball row is soft-deleted"
+        );
+        let refusal = swapped.expect_err("different bytes over a deleted release must be refused");
+        assert_eq!(refusal.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(refusal.into_body(), 65_536)
+            .await
+            .expect("refusal body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("structured 409");
+        assert_eq!(json["code"], "IMMUTABLE_RELEASE", "{json}");
+        assert!(
+            identical.is_ok(),
+            "identical bytes republish: {:?}",
+            identical.err().map(|r| r.status())
+        );
+    }
+
     /// #5: publishing a version that is already live is refused 409 with the
     /// stable `IMMUTABLE_RELEASE` code, not the generic `CONFLICT`.
     #[tokio::test]
