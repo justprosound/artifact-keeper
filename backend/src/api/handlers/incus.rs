@@ -1081,6 +1081,27 @@ async fn download_image(
 // PUT /images/{product}/{version}/{filename} -- Monolithic streaming upload
 // ---------------------------------------------------------------------------
 
+/// Refuse to store `checksum` at `artifact_path` when a deleted, released
+/// image version holds different bytes there (#32). Incus storage keys are
+/// path-derived, so this must run BEFORE any write to the storage key: a
+/// refusal after the push would arrive with the released object already
+/// overwritten. Identical bytes (an idempotent restore) pass.
+async fn ensure_incus_release_accepts(
+    db: &PgPool,
+    repo_id: Uuid,
+    artifact_path: &str,
+    checksum: &str,
+) -> crate::error::Result<()> {
+    super::ensure_release_tombstone_accepts(
+        db,
+        &crate::models::repository::RepositoryFormat::Incus,
+        repo_id,
+        artifact_path,
+        checksum,
+    )
+    .await
+}
+
 async fn upload_image(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -1125,6 +1146,10 @@ async fn upload_image(
     // removes it instead of leaking an orphan (#1573).
     let mut staged = StagedTempFile::new(temp_path.clone());
     let (size_bytes, checksum) = stream_body_to_file(body, &temp_path).await?;
+    // #32: refused while the staged body is still guarded, before the 202.
+    ensure_incus_release_accepts(&state.db, repo.id, &artifact_path, &checksum)
+        .await
+        .map_err(IntoResponse::into_response)?;
 
     // Extract metadata from the file on disk. #2561: permit-scoped decode; the
     // artifact is already staged, so a saturated server skips this best-effort
@@ -2060,6 +2085,30 @@ async fn stage_finalize_input(
     Ok((final_bytes, checksum))
 }
 
+/// Drop a claimed session whose staged bytes can never be stored (checksum
+/// mismatch, #32 release refusal): remove the staging files, delete the
+/// session (token-guarded: only the lease owner may delete it out from under
+/// other requests), and purge its backend chunks once the row is gone.
+async fn discard_refused_finalize(
+    state: &SharedState,
+    repo: &RepoInfo,
+    session_id: Uuid,
+    finalize_token: Uuid,
+    [temp_path, sealed_path, final_path]: [&Path; 3],
+    staged_keys: &[String],
+) {
+    remove_staging_files(temp_path, sealed_path, final_path).await;
+    let deleted =
+        sqlx::query("DELETE FROM incus_upload_sessions WHERE id = $1 AND finalize_token = $2")
+            .bind(session_id)
+            .bind(finalize_token)
+            .execute(&state.db)
+            .await;
+    if matches!(deleted, Ok(r) if r.rows_affected() == 1) {
+        purge_staged_parts(state, repo, staged_keys).await;
+    }
+}
+
 async fn complete_chunked_upload(
     State(state): State<SharedState>,
     Extension(auth): Extension<Option<AuthExtension>>,
@@ -2197,19 +2246,16 @@ async fn complete_chunked_upload(
     if let Some(expected) = headers.get("X-Checksum-Sha256") {
         let expected = expected.to_str().unwrap_or("");
         if expected != checksum {
-            // Checksum mismatch — clean up (token-guarded: only the lease
-            // owner may delete the session out from under other requests)
-            remove_staging_files(&temp_path, &sealed_path, &final_path).await;
-            let deleted = sqlx::query(
-                "DELETE FROM incus_upload_sessions WHERE id = $1 AND finalize_token = $2",
+            // Checksum mismatch — these bytes can never be stored.
+            discard_refused_finalize(
+                &state,
+                &repo,
+                session_id,
+                finalize_token,
+                [&temp_path, &sealed_path, &final_path],
+                &staged_keys,
             )
-            .bind(session_id)
-            .bind(finalize_token)
-            .execute(&state.db)
             .await;
-            if matches!(deleted, Ok(r) if r.rows_affected() == 1) {
-                purge_staged_parts(&state, &repo, &staged_keys).await;
-            }
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!(
@@ -2219,6 +2265,24 @@ async fn complete_chunked_upload(
             )
                 .into_response());
         }
+    }
+
+    // #32: a byte swap behind a deleted, released image is refused before
+    // the finalize pushes anything to the storage key. Like a checksum
+    // mismatch, these bytes can never be stored, so the session is dropped.
+    if let Err(e) =
+        ensure_incus_release_accepts(&state.db, repo.id, &session.artifact_path, &checksum).await
+    {
+        discard_refused_finalize(
+            &state,
+            &repo,
+            session_id,
+            finalize_token,
+            [&temp_path, &sealed_path, &final_path],
+            &staged_keys,
+        )
+        .await;
+        return Err(e.into_response());
     }
 
     // Extract metadata from the file on disk. #2561: permit-scoped decode; the
@@ -2696,6 +2760,11 @@ async fn run_finalize(
     {
         return Err(scope.exceeded_message().to_string());
     }
+    // #32: the request already checked, but an image deleted after its 202
+    // must not have its released object overwritten by this push either.
+    ensure_incus_release_accepts(&state.db, p.repo_id, &p.artifact_path, &p.checksum)
+        .await
+        .map_err(|e| e.to_string())?;
     put_staged_upload_to_storage(
         state,
         repo,
