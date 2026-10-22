@@ -233,6 +233,12 @@ pub struct CreateRepositoryRequest {
     /// `repository-owner` role scoped to the new repository. The legacy
     /// `developer` grant is retained during the staged authorization rollout.
     pub created_by: Option<Uuid>,
+    /// Release immutability policy (#6), already validated by the handler.
+    /// Persisted in the create tx, so a repository never exists with the
+    /// policy off when the caller asked for it on. `None` keeps the column
+    /// defaults (`off`, no exclusions).
+    pub release_immutability:
+        Option<crate::services::release_immutability::ReleaseImmutabilityPolicy>,
 }
 
 /// Request to update a repository
@@ -1404,6 +1410,9 @@ impl RepositoryService {
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| AppError::Database(e.to_string()))?;
+                }
+                if let Some(ref policy) = req.release_immutability {
+                    crate::services::release_immutability::store(&mut *tx, repo.id, policy).await?;
                 }
                 // Owner auto-grant: dual-write the durable repository-owner
                 // and legacy developer roles during the staged rollout. Both
@@ -3799,6 +3808,7 @@ mod tests {
             trusted_gpg_key: None,
             curation_allow_unverified: None,
             created_by: None,
+            release_immutability: None,
         };
         assert_eq!(req.key, "my-repo");
         assert_eq!(req.format, RepositoryFormat::Maven);
@@ -3827,6 +3837,7 @@ mod tests {
             trusted_gpg_key: None,
             curation_allow_unverified: None,
             created_by: None,
+            release_immutability: None,
         };
         assert_eq!(
             req.upstream_url,
@@ -5448,6 +5459,7 @@ mod tests {
                 trusted_gpg_key: None,
                 curation_allow_unverified: None,
                 created_by: None,
+                release_immutability: None,
             }
         }
 

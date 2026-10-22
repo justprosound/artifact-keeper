@@ -4205,15 +4205,13 @@ pub async fn create_repository(
                 // Always record the creator. The owner role auto-grant is
                 // applied only for provisioners (see `provisioner` above).
                 created_by: Some(auth.user_id),
+                // #6: persisted in the create tx; validated above.
+                release_immutability: immutability_policy.clone(),
             },
             payload.repodata_depth.unwrap_or(0),
             provisioner,
         )
         .await?;
-
-    if let Some(ref policy) = immutability_policy {
-        release_immutability::store(&state.db, repo.id, policy).await?;
-    }
 
     // Provision the hex registry signing key (#2641). A hosted hex repository is
     // unusable by a real `mix` client until its registry resources are signed,

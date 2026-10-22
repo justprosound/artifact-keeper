@@ -152,9 +152,12 @@ mod tests {
         )
     }
 
-    /// An npm tarball is a released coordinate under the always-on rules, so
-    /// the policy adds nothing here; this pins that switching it on keeps the
-    /// refusal typed and leaves a fresh version publishable.
+    /// A hosted npm tarball (`{pkg}/{ver}/{pkg}-{ver}.tgz`) was read as
+    /// packument metadata until #33, so its bytes could be swapped after a
+    /// delete whatever the policy said. With #33 it is a released coordinate
+    /// under the always-on rules and the policy adds nothing; this pins that
+    /// the swap is refused with the typed code under the policy, and that a
+    /// fresh version still publishes.
     #[tokio::test]
     async fn npm_handler_tarball_swap_refused_with_policy_on_db() {
         let Some(fx) = tdh::Fixture::setup("local", "npm").await else {
