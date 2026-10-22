@@ -7082,4 +7082,149 @@ mod streaming_pipeline_regression_tests {
 
         f.teardown().await;
     }
+
+    // -----------------------------------------------------------------------
+    // #32: a deleted, released image version keeps its bytes. Re-uploading
+    // different bytes is refused 409 IMMUTABLE_RELEASE before anything is
+    // written to the storage key; identical bytes are an idempotent restore.
+    // -----------------------------------------------------------------------
+
+    async fn send_image(
+        f: &tdh::Fixture,
+        method: &str,
+        uri: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, bytes::Bytes) {
+        let req = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::from(body))
+            .expect("build request");
+        tdh::send(f.router_with_auth(router()), req).await
+    }
+
+    /// PUT a monolithic image and wait for its finalize to complete.
+    async fn publish_image(f: &tdh::Fixture, uri: &str, body: Vec<u8>) {
+        let (status, resp) = send_image(f, "PUT", uri, body).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "publish: {}",
+            String::from_utf8_lossy(&resp)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&resp).expect("upload JSON");
+        let session_id: Uuid = json["session_id"].as_str().unwrap().parse().unwrap();
+        let progress = await_finalize(f, session_id).await;
+        assert_eq!(
+            progress["status"].as_str(),
+            Some("completed"),
+            "publish finalize: {progress}"
+        );
+    }
+
+    /// The bytes currently stored under the image's storage key.
+    async fn stored_image_bytes(f: &tdh::Fixture, artifact_path: &str) -> bytes::Bytes {
+        let storage = f
+            .state
+            .storage_for_repo(&f.repo_info("local", None).storage_location())
+            .expect("storage backend");
+        storage
+            .get(&build_storage_key(&f.repo_id, artifact_path))
+            .await
+            .expect("stored image object")
+    }
+
+    fn assert_immutable_release(status: StatusCode, body: &[u8], what: &str) {
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "{what}: {}",
+            String::from_utf8_lossy(body)
+        );
+        let json: serde_json::Value = serde_json::from_slice(body)
+            .unwrap_or_else(|e| panic!("{what}: body is not JSON ({e})"));
+        assert_eq!(
+            json["code"],
+            crate::error::IMMUTABLE_RELEASE_CODE,
+            "{what}: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn monolithic_reupload_after_delete_cannot_swap_a_released_image_32() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let (product, version, filename) = ("frozen", "20261022", "incus.tar.xz");
+        let artifact_path = build_artifact_path(product, version, filename);
+        let uri = format!("/{}/images/{product}/{version}/{filename}", f.repo_key);
+        let original = vec![0x5Au8; 64 * 1024];
+        publish_image(&f, &uri, original.clone()).await;
+        let (status, _) = send_image(&f, "DELETE", &uri, Vec::new()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "delete the released image");
+
+        let (status, body) = send_image(&f, "PUT", &uri, vec![0xA5u8; 64 * 1024]).await;
+        assert_immutable_release(status, &body, "different bytes after delete");
+        assert_eq!(
+            stored_image_bytes(&f, &artifact_path).await.as_ref(),
+            original.as_slice(),
+            "the refused upload must not touch the released object"
+        );
+
+        // Identical bytes restore the deleted version.
+        publish_image(&f, &uri, original.clone()).await;
+        assert_eq!(
+            stored_image_bytes(&f, &artifact_path).await.as_ref(),
+            original.as_slice()
+        );
+        f.teardown().await;
+    }
+
+    #[tokio::test]
+    async fn chunked_reupload_after_delete_cannot_swap_a_released_image_32() {
+        let Some(f) = tdh::Fixture::setup("local", "incus").await else {
+            return;
+        };
+        let (product, version, filename) = ("frozen", "20261022", "rootfs.squashfs");
+        let artifact_path = build_artifact_path(product, version, filename);
+        let uri = format!("/{}/images/{product}/{version}/{filename}", f.repo_key);
+        let original = vec![0x11u8; 96 * 1024];
+        publish_image(&f, &uri, original.clone()).await;
+        let (status, _) = send_image(&f, "DELETE", &uri, Vec::new()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "delete the released image");
+
+        let (status, body) = send_image(
+            &f,
+            "POST",
+            &format!("{uri}/uploads"),
+            vec![0x22u8; 48 * 1024],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "start: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let start: serde_json::Value = serde_json::from_slice(&body).expect("start JSON");
+        let session_id: Uuid = start["session_id"].as_str().unwrap().parse().unwrap();
+        let (status, body) = send_image(
+            &f,
+            "PUT",
+            &format!("/{}/uploads/{session_id}", f.repo_key),
+            vec![0x33u8; 48 * 1024],
+        )
+        .await;
+        assert_immutable_release(status, &body, "chunked completion after delete");
+        assert_eq!(
+            stored_image_bytes(&f, &artifact_path).await.as_ref(),
+            original.as_slice(),
+            "the refused finalize must not touch the released object"
+        );
+        assert!(
+            !temp_upload_path(f.storage_dir.to_str().unwrap(), &session_id).exists(),
+            "a refused completion must not leave staged data behind"
+        );
+        f.teardown().await;
+    }
 }
