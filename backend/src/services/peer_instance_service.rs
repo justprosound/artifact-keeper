@@ -870,7 +870,10 @@ impl PeerInstanceService {
 
         let completed_at = if matches!(
             status,
-            SyncStatus::Completed | SyncStatus::Failed | SyncStatus::Cancelled
+            SyncStatus::Completed
+                | SyncStatus::Failed
+                | SyncStatus::Cancelled
+                | SyncStatus::Refused
         ) {
             Some(Utc::now())
         } else {
@@ -1036,6 +1039,8 @@ pub enum SyncStatus {
     Completed,
     Failed,
     Cancelled,
+    /// Refused by the peer for release immutability; terminal (#4812).
+    Refused,
 }
 
 /// Sync task model
@@ -1686,7 +1691,10 @@ mod tests {
     fn sync_task_completed_at(status: SyncStatus, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         if matches!(
             status,
-            SyncStatus::Completed | SyncStatus::Failed | SyncStatus::Cancelled
+            SyncStatus::Completed
+                | SyncStatus::Failed
+                | SyncStatus::Cancelled
+                | SyncStatus::Refused
         ) {
             Some(now)
         } else {

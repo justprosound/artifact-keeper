@@ -230,6 +230,7 @@ fn sync_status_label(status: SyncStatus) -> &'static str {
         SyncStatus::Completed => "completed",
         SyncStatus::Failed => "failed",
         SyncStatus::Cancelled => "cancelled",
+        SyncStatus::Refused => "refused",
     }
 }
 
@@ -849,6 +850,7 @@ mod tests {
         assert_eq!(sync_status_label(SyncStatus::Completed), "completed");
         assert_eq!(sync_status_label(SyncStatus::Failed), "failed");
         assert_eq!(sync_status_label(SyncStatus::Cancelled), "cancelled");
+        assert_eq!(sync_status_label(SyncStatus::Refused), "refused");
     }
 
     #[test]

@@ -14,6 +14,9 @@ pub enum SyncStatus {
     Completed,
     Failed,
     Cancelled,
+    /// The peer refused the write or delete for a release-immutability reason
+    /// (`409 IMMUTABLE_RELEASE`). Terminal: never retried (#4812).
+    Refused,
 }
 
 /// Sync task entity for artifact replication to peer instances.

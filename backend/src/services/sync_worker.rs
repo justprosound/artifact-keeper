@@ -1180,7 +1180,8 @@ async fn execute_transfer(
                 .await
                 .unwrap_or_else(|_| unreadable_response_body());
             let msg = format_peer_response_failure("Remote peer returned", status.as_u16(), &body);
-            handle_transfer_failure(db, task, &msg, retry_policy).await;
+            handle_peer_response_failure(db, task, status.as_u16(), &body, &msg, retry_policy)
+                .await;
             Err(msg)
         }
         Err(e) => {
@@ -1241,7 +1242,7 @@ async fn execute_chunked_transfer(
             .unwrap_or_else(|_| unreadable_response_body());
         let msg =
             format_peer_response_failure("Chunked upload init returned", status.as_u16(), &body);
-        handle_transfer_failure(db, task, &msg, retry_policy).await;
+        handle_peer_response_failure(db, task, status.as_u16(), &body, &msg, retry_policy).await;
         return Err(msg);
     }
 
@@ -1332,7 +1333,8 @@ async fn execute_chunked_transfer(
                 let msg = format!("Chunk {} upload returned {status}: {body}", chunk_index);
                 cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id)
                     .await;
-                handle_transfer_failure(db, task, &msg, retry_policy).await;
+                handle_peer_response_failure(db, task, status.as_u16(), &body, &msg, retry_policy)
+                    .await;
                 return Err(msg);
             }
             Err(e) => {
@@ -1377,7 +1379,8 @@ async fn execute_chunked_transfer(
                 .unwrap_or_else(|_| unreadable_response_body());
             let msg = format!("Chunked upload session complete returned {status}: {body}");
             cancel_chunked_upload_session(client, peer_endpoint, peer_api_key, &session_id).await;
-            handle_transfer_failure(db, task, &msg, retry_policy).await;
+            handle_peer_response_failure(db, task, status.as_u16(), &body, &msg, retry_policy)
+                .await;
             Err(msg)
         }
         Err(e) => {
@@ -1425,7 +1428,8 @@ async fn execute_delete(
                 .await
                 .unwrap_or_else(|_| unreadable_response_body());
             let msg = format!("Remote peer returned {status} for delete: {body}");
-            handle_transfer_failure(db, task, &msg, retry_policy).await;
+            handle_peer_response_failure(db, task, status.as_u16(), &body, &msg, retry_policy)
+                .await;
             Err(msg)
         }
         Err(e) => {
@@ -1880,6 +1884,73 @@ pub(crate) fn parse_chunked_session_id(session: &serde_json::Value) -> Option<Uu
 /// would never make it "more deleted".
 pub(crate) fn delete_response_is_success(status: u16) -> bool {
     (200..300).contains(&status) || status == 404
+}
+
+/// Whether a peer's error response is a release-immutability refusal: `409`
+/// carrying the stable `IMMUTABLE_RELEASE` code (#4812). Such a refusal is
+/// terminal, because retrying the same write or delete can never succeed, so
+/// the task is marked `refused` instead of being re-queued.
+pub(crate) fn is_terminal_peer_refusal(status: u16, body: &str) -> bool {
+    status == 409
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_owned))
+            .is_some_and(|code| code == crate::error::IMMUTABLE_RELEASE_CODE)
+}
+
+/// Record a peer's HTTP error for `task`: a release-immutability refusal ends
+/// the task as `refused` (no retry, no peer backoff); anything else takes the
+/// normal retry path.
+async fn handle_peer_response_failure(
+    db: &PgPool,
+    task: &Claimed<TaskRow>,
+    status: u16,
+    body: &str,
+    error_message: &str,
+    retry_policy: SyncRetryPolicy,
+) {
+    if is_terminal_peer_refusal(status, body) {
+        handle_transfer_refused(db, task, error_message).await;
+    } else {
+        handle_transfer_failure(db, task, error_message, retry_policy).await;
+    }
+}
+
+/// Mark `task` `refused` (owner only). The peer is healthy, it just will not
+/// accept this change, so no retry is scheduled and the peer's failure
+/// counters and backoff are left alone.
+async fn handle_transfer_refused(db: &PgPool, task: &Claimed<TaskRow>, error_message: &str) {
+    let result = sqlx::query(
+        r#"
+        UPDATE sync_tasks
+        SET status = 'refused',
+            completed_at = NOW(),
+            error_message = $2,
+            claimed_by = NULL,
+            claim_token = NULL,
+            claim_expires_at = NULL
+        WHERE id = $1
+          AND status = 'in_progress'
+          AND claim_token = $3
+        "#,
+    )
+    .bind(task.id)
+    .bind(error_message)
+    .bind(task.claim_token())
+    .execute(db)
+    .await;
+    match result {
+        Ok(r) if r.rows_affected() == 1 => tracing::warn!(
+            "Sync task {} refused by peer (release immutability), not retried: {}",
+            task.id,
+            error_message
+        ),
+        Ok(_) => tracing::warn!(
+            "Sync task {} was refused here but its claim was lost; skipping",
+            task.id
+        ),
+        Err(e) => tracing::warn!("Failed to mark sync task {} refused: {e}", task.id),
+    }
 }
 
 /// Placeholder used when a peer's HTTP error response body cannot be read.
@@ -2630,6 +2701,27 @@ mod tests {
     #[test]
     fn test_unreadable_response_body_placeholder() {
         assert_eq!(unreadable_response_body(), "<unreadable>");
+    }
+
+    /// #4812: only a 409 carrying the stable immutability code is terminal.
+    #[test]
+    fn terminal_peer_refusal_is_only_the_immutability_409() {
+        assert!(is_terminal_peer_refusal(
+            409,
+            r#"{"code":"IMMUTABLE_RELEASE","message":"Artifact version already exists and is immutable"}"#
+        ));
+        // Other conflicts (quarantine, races) and other statuses stay retriable.
+        assert!(!is_terminal_peer_refusal(
+            409,
+            r#"{"code":"CONFLICT","message":"x"}"#
+        ));
+        assert!(!is_terminal_peer_refusal(409, "plain text conflict"));
+        assert!(!is_terminal_peer_refusal(409, &unreadable_response_body()));
+        assert!(!is_terminal_peer_refusal(
+            500,
+            r#"{"code":"IMMUTABLE_RELEASE","message":"x"}"#
+        ));
+        assert!(!is_terminal_peer_refusal(403, r#"{"code":"FORBIDDEN"}"#));
     }
 
     #[test]
@@ -4353,6 +4445,63 @@ mod tests {
             serde_json::json!({"files": ["kept.class"]})
         );
         teardown_claim_fixture(&f).await;
+    }
+
+    /// #4812: a peer's `409 IMMUTABLE_RELEASE` ends the task `refused` after one
+    /// attempt (no retry count, never re-claimed); any other 409 still takes
+    /// the normal retry path.
+    #[tokio::test]
+    async fn immutability_refusal_is_terminal_other_conflicts_retry_db() {
+        let Some(f) = setup_claim_fixture(2).await else {
+            return;
+        };
+        let claimed = claim_all(&f, 5, 5, "worker-a", 60.0).await;
+        assert_eq!(claimed.len(), 2);
+        let refusal = r#"{"code":"IMMUTABLE_RELEASE","message":"Artifact version already exists and is immutable"}"#;
+        handle_peer_response_failure(
+            &f.pool,
+            &claimed[0],
+            409,
+            refusal,
+            "Remote peer returned 409",
+            SyncRetryPolicy::from_env(),
+        )
+        .await;
+        handle_peer_response_failure(
+            &f.pool,
+            &claimed[1],
+            409,
+            r#"{"code":"CONFLICT","message":"held"}"#,
+            "Remote peer returned 409",
+            SyncRetryPolicy::from_env(),
+        )
+        .await;
+
+        let state = |id: Uuid| {
+            let pool = f.pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, i32, Option<String>)>(
+                    "SELECT status::TEXT, retry_count, error_message FROM sync_tasks WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("task state")
+            }
+        };
+        let (refused_status, refused_retries, refused_msg) = state(claimed[0].id).await;
+        let (failed_status, _, _) = state(claimed[1].id).await;
+        let again = claim_all(&f, 5, 5, "worker-a", 60.0).await;
+        teardown_claim_fixture(&f).await;
+
+        assert_eq!(refused_status, "refused");
+        assert_eq!(refused_retries, 0, "a refusal is not a retry");
+        assert_eq!(refused_msg.as_deref(), Some("Remote peer returned 409"));
+        assert_eq!(failed_status, "failed", "other conflicts keep retrying");
+        assert!(
+            again.iter().all(|t| t.id != claimed[0].id),
+            "a refused task is never claimed again"
+        );
     }
 
     #[tokio::test]
