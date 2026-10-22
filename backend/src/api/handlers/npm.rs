@@ -16091,13 +16091,14 @@ mod tests {
                 .expect("serialize publish body"),
             )
         };
+        let headers = HeaderMap::new();
         let publish = |body: Bytes| {
             super::publish_package(
                 &fx.state,
                 Some(tdh::make_auth(fx.user_id, &fx.username)),
                 &fx.repo_key,
                 "swapme",
-                &HeaderMap::new(),
+                &headers,
                 body,
             )
         };

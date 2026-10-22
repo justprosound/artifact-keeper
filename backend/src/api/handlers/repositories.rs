@@ -31448,11 +31448,25 @@ mod tests {
         );
 
         // (4) Scoped delete via the canonical `/-/` URL shape -> Ok (was 404),
-        // and the row is soft-deleted. npm tarballs classify Mutable (no `/-/`
-        // in the resolved stored path) so the immutability gate permits this.
-        let del_scoped = delete_artifact(
+        // and the row is soft-deleted. A hosted tarball is a released
+        // coordinate (#33), so the immutability delete guard refuses a
+        // non-admin and an admin retracts it.
+        let refused = delete_artifact(
             State(state.clone()),
             Extension(auth.clone()),
+            Path((key.clone(), "@scope/pkg/-/pkg-2.1.0.tgz".to_string())),
+            Query(DeleteArtifactQuery::default()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(AppError::Immutable(_))),
+            "a non-admin may not delete a released hosted tarball (#33): {refused:?}"
+        );
+        let admin = Some(tdh::admin_auth(user_id, &username));
+        let del_scoped = delete_artifact(
+            State(state.clone()),
+            Extension(admin.clone()),
             Path((key.clone(), "@scope/pkg/-/pkg-2.1.0.tgz".to_string())),
             Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
@@ -31475,7 +31489,7 @@ mod tests {
         // (5) Unscoped delete via the canonical `/-/` URL shape -> Ok, row gone.
         let del_unscoped = delete_artifact(
             State(state.clone()),
-            Extension(auth.clone()),
+            Extension(admin.clone()),
             Path((key.clone(), "npm-test/-/npm-test-1.0.0.tgz".to_string())),
             Query(DeleteArtifactQuery::default()),
             HeaderMap::new(),
