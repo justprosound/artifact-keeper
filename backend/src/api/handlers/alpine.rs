@@ -1389,7 +1389,8 @@ async fn upload_package_put(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "alpine", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "alpine", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -1398,6 +1399,7 @@ async fn upload_package_put(
         return Err((StatusCode::BAD_REQUEST, "File must have .apk extension").into_response());
     }
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     store_apk(
         &state,
         &repo,
@@ -1408,6 +1410,7 @@ async fn upload_package_put(
         &headers,
         body,
         user_id,
+        &ovr,
     )
     .await
 }
@@ -1424,7 +1427,8 @@ async fn upload_package_post(
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "alpine", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "alpine", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_alpine_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -1472,6 +1476,7 @@ async fn upload_package_post(
         .unwrap_or("x86_64")
         .to_string();
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     store_apk(
         &state,
         &repo,
@@ -1482,6 +1487,7 @@ async fn upload_package_post(
         &headers,
         body,
         user_id,
+        &ovr,
     )
     .await
 }
@@ -1501,6 +1507,7 @@ async fn store_apk(
     headers: &HeaderMap,
     content: Bytes,
     user_id: uuid::Uuid,
+    ovr: &crate::services::immutability_override::ImmutabilityOverride,
 ) -> Result<Response, Response> {
     let computed_sha256 = sha256_hex(&content);
 
@@ -1559,6 +1566,7 @@ async fn store_apk(
         repo.id,
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
+        ovr,
     )
     .await
     .map_err(IntoResponse::into_response)?;

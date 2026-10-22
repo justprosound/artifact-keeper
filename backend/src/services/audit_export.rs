@@ -95,6 +95,8 @@ impl AuditAction {
             // #4677: the limiter refused the attempt before any credential
             // was checked; a refusal of the caller, not a credential failure.
             AuditAction::LoginRateLimited => Outcome::Denied,
+            // #10: an override request refused for want of authority.
+            AuditAction::ImmutabilityDenied => Outcome::Denied,
             AuditAction::Login
             | AuditAction::Logout
             | AuditAction::PasswordChanged
@@ -179,7 +181,8 @@ impl AuditAction {
             | AuditAction::AttestationVerified
             | AuditAction::EnvironmentRegistered
             | AuditAction::EnvironmentDeleted
-            | AuditAction::ExternalFindingsIngested => Outcome::Success,
+            | AuditAction::ExternalFindingsIngested
+            | AuditAction::ImmutabilityOverridden => Outcome::Success,
         }
     }
 }
@@ -635,6 +638,27 @@ pub mod details {
         /// A non-secret summary of the new value, when safe to record.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub new_value: Option<String>,
+    }
+
+    /// `IMMUTABILITY_OVERRIDDEN` / `IMMUTABILITY_DENIED` (#10): an explicit
+    /// override of a release-immutability refusal, honoured or refused.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct ImmutabilityOverrideDetails {
+        /// The repository holding the coordinate.
+        pub repository_id: Uuid,
+        /// The artifact path the rule protected.
+        pub path: String,
+        /// Which enforcement point fired (`upload`, `tombstone_purge`,
+        /// `delete`, `trash_purge`, `migration`, `promotion`).
+        pub enforcement_point: crate::services::immutability_override::EnforcementPoint,
+        /// The operator's stated reason, as supplied.
+        pub reason: String,
+        /// The authority the override was honoured under
+        /// (`instance_admin` / `repository_admin`); absent on a refusal.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub actor_tier: Option<crate::services::immutability_override::OverrideTier>,
+        /// The refusal the override waived, or that stood.
+        pub refusal: String,
     }
 
     impl TokenDetails {

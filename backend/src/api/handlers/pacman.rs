@@ -617,16 +617,18 @@ async fn upload(
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "pacman", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "pacman", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_pacman_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     match fmt::classify_repo_file(&filename) {
         Some(RepoFile::Package {
             filename,
             signature: false,
-        }) => store_package(&state, &repo, filename, body, user_id, &headers).await,
+        }) => store_package(&state, &repo, filename, body, user_id, &headers, &ovr).await,
         Some(RepoFile::Package {
             filename,
             signature: true,
@@ -719,6 +721,7 @@ async fn store_package(
     body: Bytes,
     user_id: uuid::Uuid,
     headers: &HeaderMap,
+    ovr: &crate::services::immutability_override::ImmutabilityOverride,
 ) -> Result<Response, Response> {
     // #2561: hold an ingest-decompression permit across the blocking walk.
     let data = body.clone();
@@ -756,6 +759,7 @@ async fn store_package(
         &artifact_path,
         super::IncomingDigest::Bytes(&body),
         "Package already exists",
+        ovr,
     )
     .await?;
 

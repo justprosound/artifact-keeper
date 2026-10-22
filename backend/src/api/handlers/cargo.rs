@@ -1726,6 +1726,7 @@ async fn store_crate_artifact(
     cargo_metadata: serde_json::Value,
     user_id: uuid::Uuid,
     headers: &HeaderMap,
+    ovr: &crate::services::immutability_override::ImmutabilityOverride,
 ) -> Result<(), Response> {
     // Captured before `cargo_metadata` is handed to the metadata INSERT: the
     // catalog registration below reads the manifest description from it.
@@ -1768,6 +1769,7 @@ async fn store_crate_artifact(
         repo.id,
         &artifact_path,
         checksum,
+        ovr,
     )
     .await
     .map_err(|e| match e {
@@ -1875,6 +1877,7 @@ async fn publish(
     // accepted for `cargo publish`. Enforce the write scope on the token
     // before falling back to the Bearer-as-base64 credential path.
     crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
+    let override_auth = auth.clone();
     let user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "cargo")
             .await?;
@@ -1914,6 +1917,8 @@ async fn publish(
 
     let size_bytes = parsed.crate_bytes.len() as i64;
 
+    let ovr =
+        proxy_helpers::request_override(&state, override_auth.as_ref(), &headers, repo.id).await?;
     store_crate_artifact(
         &state,
         &repo,
@@ -1924,6 +1929,7 @@ async fn publish(
         cargo_metadata,
         user_id,
         &headers,
+        &ovr,
     )
     .await?;
 

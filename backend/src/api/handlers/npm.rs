@@ -5772,6 +5772,7 @@ async fn store_npm_version(
     user_id: uuid::Uuid,
     ver: &NpmVersionToPublish,
     enqueue_sync_tasks: bool,
+    ovr: &crate::services::immutability_override::ImmutabilityOverride,
 ) -> Result<(), Response> {
     let artifact_path = build_npm_artifact_path(package_name, &ver.version, &ver.tarball_filename);
 
@@ -5804,6 +5805,7 @@ async fn store_npm_version(
         repo_id,
         &artifact_path,
         &ver.sha256,
+        ovr,
     )
     .await
     .map_err(|e| e.into_response())?;
@@ -6047,6 +6049,7 @@ async fn publish_package(
 
     let parsed = parse_npm_publish_payload(&body, package_name)?;
     let enqueue_sync_tasks = !super::is_replication_request(headers);
+    let ovr = proxy_helpers::request_override(state, auth.as_ref(), headers, repo.id).await?;
 
     for ver in &parsed.versions {
         store_npm_version(
@@ -6058,6 +6061,7 @@ async fn publish_package(
             user_id,
             ver,
             enqueue_sync_tasks,
+            &ovr,
         )
         .await?;
     }

@@ -6241,7 +6241,8 @@ async fn upload_package_put(
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "conda", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -6254,6 +6255,7 @@ async fn upload_package_put(
             .into_response());
     }
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     store_conda_package(
         &state,
         &repo,
@@ -6262,6 +6264,7 @@ async fn upload_package_put(
         &headers,
         body,
         user_id,
+        &ovr,
     )
     .await
 }
@@ -6278,7 +6281,8 @@ async fn upload_post(
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "conda", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_conda_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -6301,6 +6305,7 @@ async fn upload_post(
             .into_response());
     }
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     store_conda_package(
         &state,
         &repo,
@@ -6309,6 +6314,7 @@ async fn upload_post(
         &headers,
         body,
         user_id,
+        &ovr,
     )
     .await
 }
@@ -6327,6 +6333,7 @@ async fn upload_package_put_with_token(
 ) -> Result<Response, Response> {
     // Try middleware auth first (if present), fall back to URL token
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let override_auth = auth.clone();
     let user_id = if auth.is_some() {
         require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id
     } else {
@@ -6345,6 +6352,8 @@ async fn upload_package_put_with_token(
             .into_response());
     }
 
+    let ovr =
+        proxy_helpers::request_override(&state, override_auth.as_ref(), &headers, repo.id).await?;
     store_conda_package(
         &state,
         &repo,
@@ -6353,6 +6362,7 @@ async fn upload_package_put_with_token(
         &headers,
         body,
         user_id,
+        &ovr,
     )
     .await
 }
@@ -6367,6 +6377,7 @@ async fn upload_post_with_token(
 ) -> Result<Response, Response> {
     // Try middleware auth first (if present), fall back to URL token
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
+    let override_auth = auth.clone();
     let user_id = if auth.is_some() {
         require_auth_basic_scope(auth, "conda", "write:artifacts")?.user_id
     } else {
@@ -6394,6 +6405,8 @@ async fn upload_post_with_token(
             .into_response());
     }
 
+    let ovr =
+        proxy_helpers::request_override(&state, override_auth.as_ref(), &headers, repo.id).await?;
     store_conda_package(
         &state,
         &repo,
@@ -6402,6 +6415,7 @@ async fn upload_post_with_token(
         &headers,
         body,
         user_id,
+        &ovr,
     )
     .await
 }
@@ -8430,6 +8444,7 @@ fn resolve_upload_subdir(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn store_conda_package(
     state: &SharedState,
     repo: &RepoInfo,
@@ -8438,6 +8453,7 @@ async fn store_conda_package(
     headers: &HeaderMap,
     content: Bytes,
     user_id: uuid::Uuid,
+    ovr: &crate::services::immutability_override::ImmutabilityOverride,
 ) -> Result<Response, Response> {
     // The subdir the package itself declares (#2561: permit-scoped decode).
     let declared_subdir = crate::util::bounded_archive::with_ingest_extraction(|| {
@@ -8521,6 +8537,7 @@ async fn store_conda_package(
         repo.id,
         &artifact_path,
         &computed_sha256,
+        ovr,
     )
     .await
     .map_err(|e| e.into_response())?;

@@ -107,6 +107,13 @@
         "properties": { "action": { "const": "SETTING_CHANGED" } }
       },
       "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/SettingDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
+    },
+    {
+      "if": {
+        "required": ["action"],
+        "properties": { "action": { "enum": ["IMMUTABILITY_OVERRIDDEN", "IMMUTABILITY_DENIED"] } }
+      },
+      "then": { "properties": { "details": { "anyOf": [{ "$ref": "#/$defs/ImmutabilityOverrideDetails" }, { "$ref": "#/$defs/TruncatedDetails" }, { "type": "null" }] } } }
     }
   ],
   "$defs": {
@@ -293,6 +300,20 @@
         "key": { "type": "string" },
         "old_value": { "type": "string" },
         "new_value": { "type": "string" }
+      }
+    },
+    "ImmutabilityOverrideDetails": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["repository_id", "path", "enforcement_point", "reason", "refusal"],
+      "description": "details for IMMUTABILITY_OVERRIDDEN / IMMUTABILITY_DENIED (#10). `actor_tier` is present only on an honoured override.",
+      "properties": {
+        "repository_id": { "type": "string", "format": "uuid" },
+        "path": { "type": "string" },
+        "enforcement_point": { "type": "string", "examples": ["upload", "tombstone_purge", "delete", "trash_purge", "migration", "promotion"] },
+        "reason": { "type": "string" },
+        "actor_tier": { "type": "string", "enum": ["instance_admin", "repository_admin"] },
+        "refusal": { "type": "string" }
       }
     }
   }

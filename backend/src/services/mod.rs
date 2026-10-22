@@ -49,6 +49,7 @@ pub mod helm_lint_checker;
 pub mod http_client;
 pub mod image_build_service;
 pub mod image_scanner;
+pub mod immutability_override;
 pub mod incus_scanner;
 pub mod ldap_env_bootstrap;
 pub mod ldap_service;

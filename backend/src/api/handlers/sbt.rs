@@ -495,7 +495,8 @@ async fn upload_artifact(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "ivy", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "ivy", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_sbt_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
@@ -545,12 +546,14 @@ async fn upload_artifact(
         ));
     }
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     super::purge_tombstone_checked(
         &state.db,
         &RepositoryFormat::Sbt,
         repo.id,
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
+        &ovr,
     )
     .await
     .map_err(IntoResponse::into_response)?;

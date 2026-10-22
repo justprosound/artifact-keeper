@@ -1629,7 +1629,8 @@ async fn upload_module(
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "terraform", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "terraform", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -1675,12 +1676,14 @@ async fn upload_module(
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     super::purge_tombstone_checked(
         &state.db,
         &RepositoryFormat::Terraform,
         repo.id,
         &artifact_path,
         super::IncomingDigest::Known(&checksum),
+        &ovr,
     )
     .await
     .map_err(IntoResponse::into_response)?;
@@ -2375,7 +2378,8 @@ async fn upload_provider(
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "terraform", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "terraform", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_terraform_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -2433,12 +2437,14 @@ async fn upload_provider(
     // Checked against the staged digest, before the put: the storage key is
     // path-derived, so a released object must be refused before it is
     // overwritten (#2).
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     super::purge_tombstone_checked(
         &state.db,
         &RepositoryFormat::Terraform,
         repo.id,
         &artifact_path,
         super::IncomingDigest::Known(&checksum),
+        &ovr,
     )
     .await
     .map_err(IntoResponse::into_response)?;

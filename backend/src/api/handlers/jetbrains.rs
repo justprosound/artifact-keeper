@@ -361,7 +361,8 @@ async fn upload_plugin(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "jetbrains", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "jetbrains", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_jetbrains_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -434,12 +435,14 @@ async fn upload_plugin(
         return Err(super::immutable_release("Plugin version already exists"));
     }
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     super::purge_tombstone_checked(
         &state.db,
         &crate::models::repository::RepositoryFormat::Jetbrains,
         repo.id,
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
+        &ovr,
     )
     .await
     .map_err(IntoResponse::into_response)?;

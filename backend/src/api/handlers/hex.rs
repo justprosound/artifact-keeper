@@ -831,7 +831,8 @@ async fn publish_package(
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "hex", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "hex", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_hex_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -925,6 +926,7 @@ async fn publish_package(
 
     let artifact_path = build_hex_artifact_path(&pkg_name, &pkg_version);
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
         &crate::models::repository::RepositoryFormat::Hex,
@@ -932,6 +934,7 @@ async fn publish_package(
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
         "Package version already exists",
+        &ovr,
     )
     .await?;
 

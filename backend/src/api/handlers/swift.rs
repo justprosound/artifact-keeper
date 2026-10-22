@@ -871,11 +871,8 @@ async fn publish_release_from_wildcard(
 ) -> Result<Response, Response> {
     let version = version_path.trim_start_matches('/').to_string();
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "swift", "write:artifacts")?.user_id;
-    publish_release(
-        state, repo_key, scope, name, version, user_id, headers, body,
-    )
-    .await
+    let auth = require_auth_basic_scope(auth, "swift", "write:artifacts")?;
+    publish_release(state, repo_key, scope, name, version, auth, headers, body).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,10 +1031,11 @@ async fn publish_release(
     scope: String,
     name: String,
     version: String,
-    user_id: uuid::Uuid,
+    auth: AuthExtension,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, Response> {
+    let user_id = auth.user_id;
     let repo = resolve_swift_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
@@ -1101,12 +1099,14 @@ async fn publish_release(
         ));
     }
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     super::purge_tombstone_checked(
         &state.db,
         &crate::models::repository::RepositoryFormat::Swift,
         repo.id,
         &artifact_path,
         super::IncomingDigest::Staged(&parts.staged),
+        &ovr,
     )
     .await
     .map_err(swift_purge_refusal)?;

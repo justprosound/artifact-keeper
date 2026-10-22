@@ -16,6 +16,9 @@ use crate::api::middleware::download_telemetry::DownloadContext;
 use crate::error::{AppError, Result};
 use crate::models::artifact::{Artifact, ArtifactMetadata, ArtifactVersion};
 use crate::models::repository::{Repository, RepositoryFormat};
+use crate::services::immutability_override::{
+    EnforcementPoint, ImmutabilityOverride, OverrideTarget,
+};
 use crate::services::opensearch_service::{ArtifactDocument, OpenSearchService};
 use crate::services::quality_check_service::QualityCheckService;
 use crate::services::repository_service::RepositoryService;
@@ -149,7 +152,31 @@ impl MultiHasher {
 /// Mlmodel only) APPENDS an immutable revision to `artifact_versions` instead
 /// of conflicting, so both checks are relaxed for the HEAD row. Old revisions
 /// stay immutable and addressable.
+///
+/// #10: `ovr` is the request's audited admin override. A refusal is waived
+/// (and recorded) when it is granted, and a refused override request is
+/// recorded as denied; pass [`ImmutabilityOverride::None`] for none. The two
+/// checks fire at most one override decision between them.
 pub(crate) async fn enforce_path_immutability(
+    db: &PgPool,
+    repository_id: Uuid,
+    repo: Option<&Repository>,
+    path: &str,
+    version: Option<&str>,
+    checksum_sha256: &str,
+    ovr: &ImmutabilityOverride,
+) -> Result<()> {
+    let verdict =
+        path_immutability_verdict(db, repository_id, repo, path, version, checksum_sha256).await;
+    ovr.apply(
+        db,
+        OverrideTarget::new(repository_id, path, EnforcementPoint::Upload),
+        verdict,
+    )
+    .await
+}
+
+async fn path_immutability_verdict(
     db: &PgPool,
     repository_id: Uuid,
     repo: Option<&Repository>,
@@ -447,6 +474,9 @@ pub struct ArtifactService {
     /// `None` outside the HTTP server (tests, one-off tooling), in which case
     /// the lifecycle emits nothing — exactly the pre-#3411 behaviour.
     event_bus: Option<Arc<crate::services::event_bus::EventBus>>,
+    /// The request's immutability override (#10), consulted by the upload
+    /// preflight. [`ImmutabilityOverride::None`] unless the handler set one.
+    immutability_override: ImmutabilityOverride,
 }
 
 impl ArtifactService {
@@ -461,6 +491,7 @@ impl ArtifactService {
             quality_check_service: None,
             search_service: None,
             event_bus: None,
+            immutability_override: ImmutabilityOverride::None,
         }
     }
 
@@ -479,6 +510,7 @@ impl ArtifactService {
             quality_check_service: None,
             search_service,
             event_bus: None,
+            immutability_override: ImmutabilityOverride::None,
         }
     }
 
@@ -507,6 +539,13 @@ impl ArtifactService {
     /// anyone, so upload-triggered outbound integrations were not possible.
     pub fn set_event_bus(&mut self, event_bus: Arc<crate::services::event_bus::EventBus>) {
         self.event_bus = Some(event_bus);
+    }
+
+    /// Apply an audited immutability override (#10) to this service's
+    /// uploads. A handler sets the value it resolved from the request with
+    /// [`ImmutabilityOverride::from_request`].
+    pub fn set_immutability_override(&mut self, ovr: ImmutabilityOverride) {
+        self.immutability_override = ovr;
     }
 
     /// Publish one repo-scoped artifact lifecycle event, if a bus is wired.
@@ -879,6 +918,7 @@ impl ArtifactService {
             path,
             version,
             checksum_sha256,
+            &self.immutability_override,
         )
         .await?;
 

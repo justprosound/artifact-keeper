@@ -2206,7 +2206,8 @@ async fn recipe_file_upload(
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
     let auth_ext = auth.and_then(|Extension(a)| a);
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth_ext, "conan", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth_ext, "conan", "write:artifacts")?;
+    let user_id = auth.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
@@ -2277,12 +2278,14 @@ async fn recipe_file_upload(
     // The checked variant additionally rejects a release-immutability swap on
     // any coordinate the classifier marks immutable (Conan paths are mutable
     // today, so this is a no-op for them and preserves same-revision overwrite).
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     super::cleanup_soft_deleted_artifact_checked(
         &state.db,
         &crate::models::repository::RepositoryFormat::Conan,
         repo.id,
         &artifact_path,
         &checksum_sha256,
+        &ovr,
     )
     .await
     .map_err(|e| e.into_response())?;
@@ -3508,7 +3511,8 @@ async fn package_file_upload(
     let repo = resolve_conan_repo(&state.db, &repo_key).await?;
     let auth_ext = auth.and_then(|Extension(a)| a);
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth_ext, "conan", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth_ext, "conan", "write:artifacts")?;
+    let user_id = auth.user_id;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
@@ -3594,12 +3598,14 @@ async fn package_file_upload(
     // The checked variant additionally rejects a release-immutability swap on
     // any coordinate the classifier marks immutable (Conan paths are mutable
     // today, so this is a no-op for them and preserves same-revision overwrite).
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     super::cleanup_soft_deleted_artifact_checked(
         &state.db,
         &crate::models::repository::RepositoryFormat::Conan,
         repo.id,
         &artifact_path,
         &checksum_sha256,
+        &ovr,
     )
     .await
     .map_err(|e| e.into_response())?;

@@ -961,7 +961,8 @@ async fn upload_chart(
 ) -> Result<Response, Response> {
     // Authenticate
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "helm", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "helm", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_helm_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
@@ -1037,6 +1038,7 @@ async fn upload_chart(
         "Chart {} version {} already exists",
         chart_name, chart_version
     );
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
         &RepositoryFormat::Helm,
@@ -1044,6 +1046,7 @@ async fn upload_chart(
         &artifact_path,
         super::IncomingDigest::Staged(&staged),
         &conflict_msg,
+        &ovr,
     )
     .await?;
 
@@ -1059,6 +1062,7 @@ async fn upload_chart(
             &prov_artifact_path,
             super::IncomingDigest::Staged(prov),
             &conflict_msg,
+            &ovr,
         )
         .await?;
     }

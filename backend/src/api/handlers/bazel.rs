@@ -572,7 +572,8 @@ async fn put_file(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "bazel", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "bazel", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_bazel_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -596,6 +597,7 @@ async fn put_file(
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
     let checksum = format!("{:x}", Sha256::digest(&body));
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     let ensure_unique = || {
         proxy_helpers::ensure_unique_artifact_path(
             &state.db,
@@ -604,6 +606,7 @@ async fn put_file(
             &artifact_path,
             super::IncomingDigest::Known(&checksum),
             "Module file already exists",
+            &ovr,
         )
     };
     ensure_unique().await?;

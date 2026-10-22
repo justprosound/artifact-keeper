@@ -24,6 +24,7 @@ use crate::api::handlers::proxy_helpers;
 use crate::api::handlers::repositories::{require_repo_action, require_repo_write_access};
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
+use crate::services::immutability_override::ImmutabilityOverride;
 use crate::services::package_service::PackageService;
 use crate::services::repository_service::RepositoryService;
 use crate::services::upload_service::{self, UploadError, UploadService};
@@ -617,6 +618,22 @@ async fn complete_session_commit(
         UploadService::release_commit_lease(&state.db, &session).await;
         return Err(e.into_response());
     }
+    // The audited immutability override (#10), sent on the completion request
+    // that performs the write.
+    let ovr = match ImmutabilityOverride::from_request(
+        headers,
+        auth,
+        session.repository_id,
+        &state.permission_service,
+    )
+    .await
+    {
+        Ok(ovr) => ovr,
+        Err(e) => {
+            UploadService::release_commit_lease(&state.db, &session).await;
+            return Err(e.into_response());
+        }
+    };
 
     // Resolve the *repo-scoped* storage backend and use a content-addressable
     // key, matching how non-chunked uploads work (issue #1168 part 3).
@@ -710,6 +727,7 @@ async fn complete_session_commit(
         &session.artifact_path,
         derived_version.as_deref(),
         &session.checksum_sha256,
+        &ovr,
     )
     .await
     {

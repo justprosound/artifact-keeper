@@ -3611,6 +3611,18 @@ pub fn captured_metric<'a>(
     })
 }
 
+/// Request headers asking for the audited immutability override (#10): the
+/// flag, plus `reason` when given.
+pub fn immutability_override_headers(reason: Option<&str>) -> axum::http::HeaderMap {
+    use crate::services::immutability_override::{OVERRIDE_HEADER, OVERRIDE_REASON_HEADER};
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(OVERRIDE_HEADER, "true".parse().unwrap());
+    if let Some(reason) = reason {
+        headers.insert(OVERRIDE_REASON_HEADER, reason.parse().unwrap());
+    }
+    headers
+}
+
 // In a `#[cfg(test)]` module (this whole file is test-only anyway) so the
 // #1315 token-mint surface gate, which skips test modules, does not count the
 // API-token mint below as a production endpoint.

@@ -8120,6 +8120,36 @@ pub async fn insert_artifact_row(
     .map_err(|e| internal_error("Database", e))
 }
 
+/// The audited immutability override (#10) a native publish request asks for:
+/// [`ImmutabilityOverride::None`] unless it sends the override header, a 400
+/// when the header comes without a valid reason. Call it after the request's
+/// write authorization and before its release check. A caller authenticated
+/// some other way than an [`AuthExtension`] (a URL token, a bearer fallback)
+/// has no principal to check, so its override is `None`.
+///
+/// [`AuthExtension`]: crate::api::middleware::auth::AuthExtension
+///
+/// [`ImmutabilityOverride::None`]: crate::services::immutability_override::ImmutabilityOverride::None
+#[allow(clippy::result_large_err)]
+pub(crate) async fn request_override(
+    state: &crate::api::SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    headers: &axum::http::HeaderMap,
+    repo_id: Uuid,
+) -> Result<crate::services::immutability_override::ImmutabilityOverride, Response> {
+    let Some(auth) = auth else {
+        return Ok(crate::services::immutability_override::ImmutabilityOverride::None);
+    };
+    crate::services::immutability_override::ImmutabilityOverride::from_request(
+        headers,
+        auth,
+        repo_id,
+        &state.permission_service,
+    )
+    .await
+    .map_err(IntoResponse::into_response)
+}
+
 /// Reject if `(repository_id, path)` already exists, otherwise sweep any
 /// soft-deleted row at that path so a subsequent INSERT can proceed.
 ///
@@ -8131,6 +8161,12 @@ pub async fn insert_artifact_row(
 /// `conflict_message` is the human-readable message of the
 /// `IMMUTABLE_RELEASE` 409 (e.g. "Module version already exists"), for both
 /// the live row and the released tombstone.
+///
+/// `ovr` is the request's audited override (#10). It waives only the
+/// released-tombstone refusal: these handlers write with a plain INSERT, so a
+/// live row stays refused (waiving it would overwrite the path-derived object
+/// and then fail the INSERT). Replacing a live native release is a delete with
+/// the override, then a republish.
 #[allow(clippy::result_large_err)]
 pub async fn ensure_unique_artifact_path(
     db: &PgPool,
@@ -8139,6 +8175,7 @@ pub async fn ensure_unique_artifact_path(
     artifact_path: &str,
     incoming: super::IncomingDigest<'_>,
     conflict_message: &str,
+    ovr: &crate::services::immutability_override::ImmutabilityOverride,
 ) -> Result<(), Response> {
     let existing: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
@@ -8153,7 +8190,7 @@ pub async fn ensure_unique_artifact_path(
         return Err(AppError::Immutable(conflict_message.to_string()).into_response());
     }
 
-    super::purge_tombstone_checked(db, format, repo_id, artifact_path, incoming)
+    super::purge_tombstone_checked(db, format, repo_id, artifact_path, incoming, ovr)
         .await
         .map_err(|e| match e {
             AppError::Immutable(_) => {
@@ -16139,6 +16176,7 @@ mod tests {
             "module/1.0.0/module-1.0.0.tar.gz",
             crate::api::handlers::IncomingDigest::Known("x"),
             "Module version already exists",
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await;
         assert!(result.is_ok());
@@ -16178,6 +16216,7 @@ mod tests {
             "coll/1.0.0/coll.tar.gz",
             crate::api::handlers::IncomingDigest::Known("x"),
             "Collection version already exists",
+            &crate::services::immutability_override::ImmutabilityOverride::None,
         )
         .await
         .expect_err("conflict expected");

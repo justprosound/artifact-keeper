@@ -340,6 +340,7 @@ async fn handle_put(
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: reject read-scoped API tokens on PUT.
     crate::api::middleware::auth::require_scope_response(auth.as_ref(), "write:artifacts")?;
+    let override_auth = auth.clone();
     let user_id =
         require_auth_with_bearer_fallback(auth, &headers, &state.db, &state.config, "goproxy")
             .await?;
@@ -354,6 +355,8 @@ async fn handle_put(
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
     let request = parse_path(&path)?;
     let enqueue_sync_tasks = !super::is_replication_request(&headers);
+    let ovr =
+        proxy_helpers::request_override(&state, override_auth.as_ref(), &headers, repo.id).await?;
 
     match request {
         GoProxyRequest::Zip { module, version } => {
@@ -365,6 +368,7 @@ async fn handle_put(
                 user_id,
                 body,
                 enqueue_sync_tasks,
+                &ovr,
             )
             .await
         }
@@ -377,6 +381,7 @@ async fn handle_put(
                 user_id,
                 body,
                 enqueue_sync_tasks,
+                &ovr,
             )
             .await
         }
@@ -1560,6 +1565,7 @@ async fn latest_version(
 // PUT /@v/{version}.zip — Upload module zip
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_zip(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1568,6 +1574,7 @@ async fn upload_zip(
     user_id: uuid::Uuid,
     body: Bytes,
     enqueue_sync_tasks: bool,
+    ovr: &crate::services::immutability_override::ImmutabilityOverride,
 ) -> Result<Response, Response> {
     let artifact_path = build_go_zip_artifact_path(module, version);
 
@@ -1597,6 +1604,7 @@ async fn upload_zip(
         repo.id,
         &artifact_path,
         super::IncomingDigest::Bytes(&body),
+        ovr,
     )
     .await
     .map_err(IntoResponse::into_response)?;
@@ -1736,6 +1744,7 @@ async fn upload_zip(
 // PUT /@v/{version}.mod — Upload go.mod
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_mod(
     state: &SharedState,
     repo: &RepoInfo,
@@ -1744,6 +1753,7 @@ async fn upload_mod(
     user_id: uuid::Uuid,
     body: Bytes,
     enqueue_sync_tasks: bool,
+    ovr: &crate::services::immutability_override::ImmutabilityOverride,
 ) -> Result<Response, Response> {
     let artifact_path = build_go_mod_artifact_path(module, version);
 
@@ -1773,6 +1783,7 @@ async fn upload_mod(
         repo.id,
         &artifact_path,
         super::IncomingDigest::Bytes(&body),
+        ovr,
     )
     .await
     .map_err(IntoResponse::into_response)?;

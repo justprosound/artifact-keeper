@@ -2370,7 +2370,8 @@ async fn upload_package_put(
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "rpm", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
     reject_rpm_write_if_not_hosted(&repo.repo_type)?;
 
@@ -2388,7 +2389,8 @@ async fn upload_package_put(
         return Err((StatusCode::BAD_REQUEST, "File must have .rpm extension").into_response());
     }
 
-    store_rpm(&state, &repo, &filename, &headers, body, user_id).await
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
+    store_rpm(&state, &repo, &filename, &headers, body, user_id, &ovr).await
 }
 
 async fn upload_relative(
@@ -2398,7 +2400,8 @@ async fn upload_relative(
     headers: HeaderMap,
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "rpm", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
     reject_rpm_write_if_not_hosted(&repo.repo_type)?;
     if rpm_layout::depth(&state.db, repo.id)
@@ -2412,7 +2415,8 @@ async fn upload_relative(
         )
             .into_response());
     }
-    store_rpm(&state, &repo, &path, &headers, body, user_id).await
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
+    store_rpm(&state, &repo, &path, &headers, body, user_id, &ovr).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2427,7 +2431,8 @@ async fn upload_package_post(
     UploadBody(body): UploadBody,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "rpm", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "rpm", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_rpm_repo(&state.db, &repo_key).await?;
     reject_rpm_write_if_not_hosted(&repo.repo_type)?;
 
@@ -2438,7 +2443,8 @@ async fn upload_package_post(
         return Err((StatusCode::BAD_REQUEST, "File must have .rpm extension").into_response());
     }
 
-    store_rpm(&state, &repo, &filename, &headers, body, user_id).await
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
+    store_rpm(&state, &repo, &filename, &headers, body, user_id, &ovr).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2452,6 +2458,7 @@ async fn store_rpm(
     headers: &HeaderMap,
     content: Bytes,
     user_id: uuid::Uuid,
+    ovr: &crate::services::immutability_override::ImmutabilityOverride,
 ) -> Result<Response, Response> {
     let depth = rpm_layout::validate_upload(&state.db, repo.id, path)
         .await
@@ -2519,6 +2526,7 @@ async fn store_rpm(
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
         "Package already exists",
+        ovr,
     )
     .await?;
 

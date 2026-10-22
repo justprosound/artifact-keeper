@@ -1101,7 +1101,8 @@ async fn upload_file_impl(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "huggingface", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "huggingface", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_huggingface_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -1144,6 +1145,7 @@ async fn upload_file_impl(
     hasher.update(&body);
     let computed_sha256 = format!("{:x}", hasher.finalize());
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
         &crate::models::repository::RepositoryFormat::Huggingface,
@@ -1151,6 +1153,7 @@ async fn upload_file_impl(
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
         "File already exists at this path",
+        &ovr,
     )
     .await?;
 
