@@ -943,6 +943,11 @@ fn api_v1_routes(
                 // instance admins. The instance-wide queue stays at
                 // /admin/age-gate behind `admin_middleware`.
                 .merge(handlers::age_gate::repo_review_routes())
+                // Release blocklist (upstream #4812):
+                // GET/POST /repositories/{key}/releases/{coordinate}/block,
+                // POST .../unblock. Gated inside the handlers on the
+                // repository `admin` action.
+                .merge(handlers::release_blocks::repo_router())
                 // Per-repo storage GC (web #708): the UI's per-repo storage
                 // panel calls POST /repositories/{key}/storage-gc. Admin-gated
                 // inside the handler.

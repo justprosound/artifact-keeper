@@ -124,6 +124,7 @@ the remaining actions is an incremental follow-up.
 | `LOGIN_FAILED`, `PERMISSION_DENIED`, `LOGIN_RATE_LIMITED` | `AuthDetails` (`username?`, `path?`, `method?`, `reason?`, federated labels?) |
 | `ARTIFACT_UPLOADED` / `_DOWNLOADED` / `_DELETED` | `ArtifactDetails` (`repository_id`, `path`, `name`, `version?`, `size_bytes?`, `digest?`, `uploaded_by?`) |
 | `SETTING_CHANGED` | `SettingDetails` (`key`, `old_value?`, `new_value?`) |
+| `RELEASE_BLOCKED` / `RELEASE_UNBLOCKED` | `ReleaseBlockDetails` (`block_id`, `repository_key`, `name?`, `version?`, `path?`, `mode`, `reason`, `actor_tier`, `block_reason?`) |
 
 ## Privileged administrative actions
 
@@ -182,6 +183,22 @@ come from the CEP-26 filename and are `null` when it does not parse).
 | `ATTESTATION_REJECTED` | `artifact` | An attestation for an existing package does not verify, or its body is not JSON. Outcome `denied` when refused (the default, `CONDA_ATTESTATION_REQUIRE_VERIFIED=true`); outcome `failure` with `stored: true` when the operator opt-out stored it anyway. | The same fields as `ATTESTATION_VERIFIED`, with `reason`: the failure reason the API returned (the text after `CEP-27 attestation verification failed: `, or `Invalid JSON body`). |
 | `ENVIRONMENT_REGISTERED` | `environment` | A lockfile is ingested as a stored environment (`POST /api/v1/repositories/{key}/environments`), new or replacing one of the same name. | `environment_id`, `name`, `lockfile_format`, `lockfile_filename`, `content_sha256`, `replaced`, `package_count` (distinct packages), `memberships`, `scope` (`count`, `environments`, `platforms`). |
 | `ENVIRONMENT_DELETED` | `environment` | A stored environment is deleted (`DELETE /api/v1/repositories/{key}/environments/{id}`). | `environment_id`, `name`, `lockfile_format`, `content_sha256`, and the stored `summary`. |
+
+## Release blocklist
+
+A block revokes a release without deleting or overwriting it (upstream
+`#4812`): every file of it refuses download with a 403 until it is unblocked.
+Both actions are held by the repository's `admin` action or an instance
+admin, need a reason, and write one row each. `resource` is the `repository`
+(id and key); `user_id` / `actor` is the caller. Outcome `success`.
+
+| Action | Fires when | `details` |
+| --- | --- | --- |
+| `RELEASE_BLOCKED` | `POST /api/v1/repositories/{key}/releases/{coordinate}/block` places a block. | `ReleaseBlockDetails`: `block_id`, `repository_key`, the coordinate (`name` and `version`, or `path` for a single-file block), `mode` (`block`), the `reason` given, and `actor_tier` (`instance_admin` / `repository_admin`). |
+| `RELEASE_UNBLOCKED` | `POST /api/v1/repositories/{key}/releases/{coordinate}/unblock` lifts one. | The same fields, with `reason` the unblock reason and `block_reason` the reason the block was placed with. |
+
+The `release_blocked` and `release_unblocked` webhooks fire alongside, with the
+block id as `entity_id`.
 
 ## Detection events
 

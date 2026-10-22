@@ -396,6 +396,9 @@ impl TrashService {
     /// object unless something else still references it. `NotFound` if it is
     /// not (or no longer) in the trash, `Conflict` if it is OCI content.
     pub async fn purge(&self, id: Uuid) -> Result<PurgedArtifact> {
+        // Purging a blocked release's tombstone would free its coordinate for
+        // different bytes (upstream #4812).
+        crate::services::release_block_service::refuse_delete_if_blocked(&self.db, id).await?;
         let mut tx = self.db.begin().await?;
         let sql = format!(
             "SELECT {TRASH_COLUMNS_SQL}, a.is_deleted, r.storage_backend, r.storage_path \

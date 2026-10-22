@@ -232,6 +232,13 @@ pub enum AuditAction {
     /// that every gate and the repository score read, including any `MAL-*`
     /// finding classed `malicious`.
     ExternalFindingsIngested,
+    /// A repository administrator blocked a release
+    /// (`POST /api/v1/repositories/{key}/releases/{coordinate}/block`): no file
+    /// of it can be downloaded until it is unblocked (upstream #4812).
+    ReleaseBlocked,
+    /// A repository administrator lifted a release block
+    /// (`POST /api/v1/repositories/{key}/releases/{coordinate}/unblock`).
+    ReleaseUnblocked,
 }
 
 impl AuditAction {
@@ -332,6 +339,8 @@ impl AuditAction {
             AuditAction::EnvironmentDeleted => "ENVIRONMENT_DELETED",
             AuditAction::LoginRateLimited => "LOGIN_RATE_LIMITED",
             AuditAction::ExternalFindingsIngested => "EXTERNAL_FINDINGS_INGESTED",
+            AuditAction::ReleaseBlocked => "RELEASE_BLOCKED",
+            AuditAction::ReleaseUnblocked => "RELEASE_UNBLOCKED",
         }
     }
 }
@@ -1524,6 +1533,13 @@ mod tests {
             AuditAction::ExternalFindingsIngested.as_str(),
             "EXTERNAL_FINDINGS_INGESTED"
         );
+    }
+
+    #[test]
+    fn test_audit_action_as_str_release_blocklist() {
+        // upstream #4812: block and unblock are distinct actions.
+        assert_eq!(AuditAction::ReleaseBlocked.as_str(), "RELEASE_BLOCKED");
+        assert_eq!(AuditAction::ReleaseUnblocked.as_str(), "RELEASE_UNBLOCKED");
     }
 
     // -----------------------------------------------------------------------

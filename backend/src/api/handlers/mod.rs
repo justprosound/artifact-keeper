@@ -70,18 +70,25 @@ pub(crate) fn immutable_release(message: impl Into<String>) -> axum::response::R
 /// that a subsequent INSERT won't violate the UNIQUE constraint.  This is a
 /// fire-and-forget cleanup: if the DELETE fails or finds nothing we just
 /// continue with the INSERT.
+///
+/// A tombstone of a blocked release (upstream #4812) is never purged: that
+/// would free the blocked coordinate. The INSERT that follows then collides
+/// with it instead of re-using the path.
 pub async fn cleanup_soft_deleted_artifact(
     db: &sqlx::PgPool,
     repository_id: uuid::Uuid,
     path: &str,
 ) {
-    let _ = sqlx::query(
-        "DELETE FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = true",
-    )
-    .bind(repository_id)
-    .bind(path)
-    .execute(db)
-    .await;
+    let sql = format!(
+        "DELETE FROM artifacts a WHERE a.repository_id = $1 AND a.path = $2 \
+         AND a.is_deleted = true AND {}",
+        crate::services::release_block_service::artifact_not_blocked_sql()
+    );
+    let _ = sqlx::query(sqlx::AssertSqlSafe(&*sql))
+        .bind(repository_id)
+        .bind(path)
+        .execute(db)
+        .await;
 }
 
 /// Remove any soft-deleted artifact at `(repository_id, path)` so a subsequent
@@ -140,6 +147,16 @@ pub async fn cleanup_soft_deleted_artifact_checked(
                 ));
             }
         }
+    }
+
+    // A blocked release's tombstone is kept whatever the bytes (upstream
+    // #4812), so the re-publish is refused here rather than failing on the
+    // unique constraint after `cleanup_soft_deleted_artifact` skips it.
+    if crate::services::release_block_service::tombstone_is_blocked(db, repository_id, path).await?
+    {
+        return Err(AppError::Immutable(
+            "Cannot re-publish over a blocked release".to_string(),
+        ));
     }
 
     cleanup_soft_deleted_artifact(db, repository_id, path).await;
@@ -481,6 +498,7 @@ pub mod puppet;
 pub mod pypi;
 pub mod quality_gates;
 pub mod quarantine;
+pub mod release_blocks;
 pub mod remote_instances;
 pub mod repo_tokens;
 pub mod repositories;

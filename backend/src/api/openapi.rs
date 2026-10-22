@@ -66,6 +66,7 @@ Basic-with-token fallback.",
         (name = "quarantine", description = "Artifact quarantine period management"),
         (name = "quality", description = "Artifact health scoring and quality gates"),
         (name = "age-gate", description = "Age-based proxy quality gate"),
+        (name = "release-blocks", description = "Release blocklist: revoke a release without deleting it"),
         (name = "service_accounts", description = "Service account management"),
         (name = "health", description = "Health and readiness checks"),
         (name = "pypi", description = "PyPI endpoints beyond the Simple API: legacy JSON API and XML-RPC"),
@@ -266,6 +267,10 @@ pub(crate) fn module_docs() -> Vec<(&'static str, utoipa::openapi::OpenApi)> {
         (
             "quarantine",
             handlers::quarantine::QuarantineApiDoc::openapi(),
+        ),
+        (
+            "release_blocks",
+            handlers::release_blocks::ReleaseBlocksApiDoc::openapi(),
         ),
         ("upload", handlers::upload::UploadApiDoc::openapi()),
         (
@@ -754,6 +759,41 @@ mod tests {
         }
     }
 
+    /// upstream #4812: the release blocklist's block, unblock and read are in
+    /// the spec with their bodies, and both writes document the reason-required
+    /// 400 and the repository-admin 403.
+    #[test]
+    fn test_openapi_release_block_endpoints_in_spec() {
+        let spec = serde_json::to_value(build_openapi()).unwrap();
+        let paths = &spec["paths"];
+        let block = &paths["/api/v1/repositories/{key}/releases/{coordinate}/block"];
+        let unblock = &paths["/api/v1/repositories/{key}/releases/{coordinate}/unblock"];
+        for (method, item, ok) in [
+            ("post", block, "201"),
+            ("post", unblock, "200"),
+            ("get", block, "200"),
+        ] {
+            let op = &item[method];
+            assert!(op.is_object(), "{method} release block route missing");
+            assert_eq!(
+                op["responses"][ok]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/ReleaseBlockResponse",
+                "{method}: {op}"
+            );
+        }
+        for op in [&block["post"], &unblock["post"]] {
+            assert_eq!(
+                op["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/ReleaseBlockRequest"
+            );
+            assert!(op["responses"]["400"].is_object(), "{op}");
+            assert!(op["responses"]["403"].is_object(), "{op}");
+        }
+        let request = &spec["components"]["schemas"]["ReleaseBlockRequest"];
+        assert!(request["properties"]["reason"].is_object());
+        assert!(request["properties"]["name"].is_object());
+    }
+
     /// Verify every path documented in the OpenAPI spec has a corresponding
     /// route registered in the handler routers. This catches the class of bug
     /// where a handler is annotated with `#[utoipa::path(...)]` and listed in
@@ -844,6 +884,7 @@ mod tests {
                     include_str!("handlers/repo_tokens.rs"),
                     include_str!("handlers/environments.rs"),
                     include_str!("handlers/artifact_presence.rs"),
+                    include_str!("handlers/release_blocks.rs"),
                 ],
             ),
             (

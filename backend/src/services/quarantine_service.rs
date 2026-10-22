@@ -694,7 +694,8 @@ pub async fn check_artifact_download(db: &PgPool, artifact_id: Uuid) -> Result<(
     enforce_download_gate(db, artifact_id).await
 }
 
-/// The shared download choke point (#2954): enforce quarantine THEN scan policy.
+/// The shared download choke point (#2954): enforce the release blocklist,
+/// then quarantine, then scan policy.
 ///
 /// This folds `PolicyService::evaluate_artifact` — which enforces the
 /// `scan_policies` columns `block_unscanned` / `block_on_fail` / `max_severity`
@@ -726,7 +727,12 @@ pub async fn enforce_download_gate(db: &PgPool, artifact_id: Uuid) -> Result<()>
         return Ok(());
     };
 
-    // Quarantine gate first (409 quarantined / 403 rejected).
+    // A blocked release (upstream #4812) refuses every file with a 403 before
+    // anything else, so a block reads the same whatever the file's quarantine
+    // state. Quarantine never lifts it: the block is not stored there.
+    crate::services::release_block_service::enforce_download_allowed(db, artifact_id).await?;
+
+    // Quarantine gate next (409 quarantined / 403 rejected).
     check_download_allowed(status.as_deref(), until, Utc::now())?;
 
     // Scan-policy gate. No-op (allowed) when no enabled policy matches the repo.

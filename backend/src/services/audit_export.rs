@@ -179,7 +179,9 @@ impl AuditAction {
             | AuditAction::AttestationVerified
             | AuditAction::EnvironmentRegistered
             | AuditAction::EnvironmentDeleted
-            | AuditAction::ExternalFindingsIngested => Outcome::Success,
+            | AuditAction::ExternalFindingsIngested
+            | AuditAction::ReleaseBlocked
+            | AuditAction::ReleaseUnblocked => Outcome::Success,
         }
     }
 }
@@ -637,6 +639,32 @@ pub mod details {
         pub new_value: Option<String>,
     }
 
+    /// `RELEASE_BLOCKED` / `RELEASE_UNBLOCKED` (upstream #4812). The
+    /// coordinate is `name` + `version` for a version block, or `path` for a
+    /// single-file block; the other side is omitted.
+    #[derive(Debug, Clone, Serialize)]
+    pub struct ReleaseBlockDetails {
+        /// The `release_blocks` row the action created or removed.
+        pub block_id: Uuid,
+        /// Repository key.
+        pub repository_key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub version: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub path: Option<String>,
+        /// Block mode (`block`).
+        pub mode: String,
+        /// The reason the actor gave for this action.
+        pub reason: String,
+        /// `instance_admin` or `repository_admin`.
+        pub actor_tier: String,
+        /// On `RELEASE_UNBLOCKED`: the reason the lifted block was placed with.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub block_reason: Option<String>,
+    }
+
     impl TokenDetails {
         /// Build token metadata from a lifecycle event. Mirrors the invariant of
         /// the existing `api_token_audit_entry` helper: the secret is never a
@@ -1062,6 +1090,8 @@ mod tests {
             AuditAction::EnvironmentRegistered,
             AuditAction::EnvironmentDeleted,
             AuditAction::ExternalFindingsIngested,
+            AuditAction::ReleaseBlocked,
+            AuditAction::ReleaseUnblocked,
         ] {
             assert_eq!(a.outcome(), Outcome::Success, "{}", a.as_str());
         }

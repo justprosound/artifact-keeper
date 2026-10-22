@@ -33,6 +33,9 @@ const OCI_CLEANUP_KEY_CLAIM_TTL_SQL: &str = "INTERVAL '15 minutes'";
 /// 3. It is not protected by an `oci_blobs` row (named blobs);
 /// 4. It is not the per-architecture child of a still-tagged OCI image index
 ///    (`oci_manifest_refs` joined against `oci_tags`; see migration 092).
+/// 5. No row holding the key, live or trashed, belongs to a blocked release
+///    (upstream #4812): its tombstones and bytes are kept for forensics, and
+///    the row delete below removes every trashed row sharing the key.
 ///
 /// The fragment expects two bindings: the outer `artifacts` row aliased
 /// `a` and the outer `repositories` row aliased `r`. Callers either inline
@@ -102,6 +105,14 @@ AND NOT EXISTS (
         r.storage_backend <> 'filesystem'
         OR omrr.storage_path = r.storage_path
       )
+)
+AND NOT EXISTS (
+    SELECT 1
+    FROM artifacts ab
+    JOIN release_blocks b ON b.repository_id = ab.repository_id
+     AND ((b.path IS NULL AND b.name = ab.name AND b.version = ab.version)
+          OR b.path = ab.path)
+    WHERE ab.storage_key = a.storage_key
 )
 "#;
 
@@ -256,7 +267,7 @@ AND NOT EXISTS (
 /// re-check is a `bool_and` over every row sharing the key, an object shared
 /// by one expired and one still-retained trashed row is kept until both have
 /// expired.
-fn orphan_predicate_sql(days: u32) -> String {
+pub(crate) fn orphan_predicate_sql(days: u32) -> String {
     format!("{ORPHAN_PREDICATE_SQL}{}", trash_retention_clause(days))
 }
 
