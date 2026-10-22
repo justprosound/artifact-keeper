@@ -340,7 +340,8 @@ async fn publish_module(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "puppet", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "puppet", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_puppet_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -393,6 +394,7 @@ async fn publish_module(
 
     let artifact_path = format!("{}/{}/{}", full_name, module_version, filename);
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
         &crate::models::repository::RepositoryFormat::Puppet,
@@ -400,7 +402,7 @@ async fn publish_module(
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
         "Module version already exists",
-        &crate::services::immutability_override::ImmutabilityOverride::None,
+        &ovr,
     )
     .await?;
 

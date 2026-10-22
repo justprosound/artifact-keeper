@@ -1139,7 +1139,8 @@ async fn upload(
     axum::Json(body): axum::Json<UploadRequest>,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "protobuf", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_protobuf_repo(&state.db, &repo_key).await?;
 
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
@@ -1228,13 +1229,14 @@ async fn upload(
 
         // Before the put: the storage key is path-derived (#2). The commit
         // digest is the row's recorded checksum.
+        let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
         super::purge_tombstone_checked(
             &state.db,
             &crate::models::repository::RepositoryFormat::Protobuf,
             repo.id,
             &artifact_path,
             super::IncomingDigest::Known(&commit_digest),
-            &crate::services::immutability_override::ImmutabilityOverride::None,
+            &ovr,
         )
         .await
         .map_err(connect_purge_error)?;

@@ -647,7 +647,8 @@ async fn upload_package(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "pub", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "pub", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_pub_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -725,13 +726,14 @@ async fn upload_package(
         return Err(pub_immutable_response("Package version already exists"));
     }
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     super::purge_tombstone_checked(
         &state.db,
         &crate::models::repository::RepositoryFormat::Pub,
         repo.id,
         &artifact_path,
         super::IncomingDigest::Staged(&staged),
-        &crate::services::immutability_override::ImmutabilityOverride::None,
+        &ovr,
     )
     .await
     .map_err(pub_purge_refusal)?;

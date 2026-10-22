@@ -544,7 +544,8 @@ async fn push_pod(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "cocoapods", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "cocoapods", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_cocoapods_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -615,13 +616,14 @@ async fn push_pod(
     )
     .await?;
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     super::purge_tombstone_checked(
         &state.db,
         &crate::models::repository::RepositoryFormat::Cocoapods,
         repo.id,
         &artifact_path,
         super::IncomingDigest::Known(&computed_sha256),
-        &crate::services::immutability_override::ImmutabilityOverride::None,
+        &ovr,
     )
     .await
     .map_err(IntoResponse::into_response)?;

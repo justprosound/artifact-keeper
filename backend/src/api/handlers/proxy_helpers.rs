@@ -8120,6 +8120,36 @@ pub async fn insert_artifact_row(
     .map_err(|e| internal_error("Database", e))
 }
 
+/// The audited immutability override (#10) a native publish request asks for:
+/// [`ImmutabilityOverride::None`] unless it sends the override header, a 400
+/// when the header comes without a valid reason. Call it after the request's
+/// write authorization and before its release check. A caller authenticated
+/// some other way than an [`AuthExtension`] (a URL token, a bearer fallback)
+/// has no principal to check, so its override is `None`.
+///
+/// [`AuthExtension`]: crate::api::middleware::auth::AuthExtension
+///
+/// [`ImmutabilityOverride::None`]: crate::services::immutability_override::ImmutabilityOverride::None
+#[allow(clippy::result_large_err)]
+pub(crate) async fn request_override(
+    state: &crate::api::SharedState,
+    auth: Option<&crate::api::middleware::auth::AuthExtension>,
+    headers: &axum::http::HeaderMap,
+    repo_id: Uuid,
+) -> Result<crate::services::immutability_override::ImmutabilityOverride, Response> {
+    let Some(auth) = auth else {
+        return Ok(crate::services::immutability_override::ImmutabilityOverride::None);
+    };
+    crate::services::immutability_override::ImmutabilityOverride::from_request(
+        headers,
+        auth,
+        repo_id,
+        &state.permission_service,
+    )
+    .await
+    .map_err(IntoResponse::into_response)
+}
+
 /// Reject if `(repository_id, path)` already exists, otherwise sweep any
 /// soft-deleted row at that path so a subsequent INSERT can proceed.
 ///

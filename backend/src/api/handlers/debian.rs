@@ -3909,6 +3909,7 @@ async fn persist_debian_upload(
     body: Bytes,
     user_id: Option<uuid::Uuid>,
     enqueue_sync_tasks: bool,
+    ovr: &crate::services::immutability_override::ImmutabilityOverride,
 ) -> Result<crate::models::artifact::Artifact, Response> {
     let existing = sqlx::query_scalar!(
         "SELECT id FROM artifacts WHERE repository_id = $1 AND path = $2 AND is_deleted = false",
@@ -3929,7 +3930,7 @@ async fn persist_debian_upload(
         repo.id,
         &upload.artifact_path,
         super::IncomingDigest::Bytes(&body),
-        &crate::services::immutability_override::ImmutabilityOverride::None,
+        ovr,
     )
     .await
     .map_err(IntoResponse::into_response)?;
@@ -4213,12 +4214,14 @@ async fn pool_upload(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "debian", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "debian", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
 
     let upload = prepare_debian_upload(&component, &path, &body)?;
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     persist_debian_upload(
         &state,
         &repo,
@@ -4226,6 +4229,7 @@ async fn pool_upload(
         body,
         Some(user_id),
         should_enqueue_debian_sync_tasks(&headers),
+        &ovr,
     )
     .await?;
 
@@ -4256,7 +4260,8 @@ async fn upload_raw(
     body: Bytes,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "debian", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "debian", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_debian_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -4299,6 +4304,7 @@ async fn upload_raw(
         .unwrap_or(&artifact_path)
         .to_string();
     let upload = prepare_debian_upload(component, &path, &body)?;
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     let artifact = persist_debian_upload(
         &state,
         &repo,
@@ -4306,6 +4312,7 @@ async fn upload_raw(
         body,
         Some(user_id),
         should_enqueue_debian_sync_tasks(&headers),
+        &ovr,
     )
     .await?;
 

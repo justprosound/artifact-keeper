@@ -3686,13 +3686,14 @@ async fn upload(
         // UNIQUE(repository_id, path) constraint doesn't block re-upload —
         // unless this is a release-immutability swap (delete + re-upload of
         // DIFFERENT bytes to an immutable coordinate), which is rejected.
+        let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
         super::cleanup_soft_deleted_artifact_checked(
             &state.db,
             &crate::models::repository::RepositoryFormat::Maven,
             repo.id,
             &path,
             &checksum_sha256,
-            &crate::services::immutability_override::ImmutabilityOverride::None,
+            &ovr,
         )
         .await
         .map_err(|e| e.into_response())?;

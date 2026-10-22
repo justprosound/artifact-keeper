@@ -1636,7 +1636,8 @@ async fn upload_collection(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
-    let user_id = require_auth_basic_scope(auth, "ansible", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "ansible", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_ansible_repo(&state.db, &repo_key).await?;
     proxy_helpers::reject_write_if_not_hosted(&repo.repo_type)?;
     repo.reject_if_promotion_only(false)?;
@@ -1775,6 +1776,7 @@ async fn upload_collection(
     crate::services::upload_service::validate_artifact_path(&artifact_path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
 
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     proxy_helpers::ensure_unique_artifact_path(
         &state.db,
         &crate::models::repository::RepositoryFormat::Ansible,
@@ -1782,7 +1784,7 @@ async fn upload_collection(
         &artifact_path,
         super::IncomingDigest::Staged(&staged),
         "Collection version already exists",
-        &crate::services::immutability_override::ImmutabilityOverride::None,
+        &ovr,
     )
     .await?;
 

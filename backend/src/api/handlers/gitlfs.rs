@@ -498,7 +498,8 @@ async fn upload_object(
     body: Body,
 ) -> Result<Response, Response> {
     // GHSA-vvc3-h39c-mrq5: enforce token scope before processing.
-    let user_id = require_auth_basic_scope(auth, "git-lfs", "write:artifacts")?.user_id;
+    let auth = require_auth_basic_scope(auth, "git-lfs", "write:artifacts")?;
+    let user_id = auth.user_id;
     let repo = resolve_lfs_repo(&state.db, &repo_key).await?;
 
     // Reject writes to remote/virtual repos
@@ -576,13 +577,14 @@ async fn upload_object(
     .await?;
 
     // Before the put: the storage key is path-derived (#2).
+    let ovr = proxy_helpers::request_override(&state, Some(&auth), &headers, repo.id).await?;
     super::purge_tombstone_checked(
         &state.db,
         &crate::models::repository::RepositoryFormat::Gitlfs,
         repo.id,
         &artifact_path,
         super::IncomingDigest::Known(&oid),
-        &crate::services::immutability_override::ImmutabilityOverride::None,
+        &ovr,
     )
     .await
     .map_err(IntoResponse::into_response)?;
