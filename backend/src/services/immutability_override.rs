@@ -170,7 +170,7 @@ fn reason_header(headers: &HeaderMap) -> Result<Option<&str>> {
 }
 
 impl ImmutabilityOverride {
-    /// An override granted outside an HTTP request (migration job, GC run) on
+    /// An override granted outside an HTTP request (a migration job) on
     /// behalf of `actor`, who held `tier` when the job was created. The reason
     /// is validated exactly as a request's is.
     pub fn granted(actor: OverrideActor, reason: &str, tier: OverrideTier) -> Result<Self> {
